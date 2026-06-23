@@ -1,0 +1,569 @@
+#!/usr/bin/env bash
+#
+# whatsthis — Workflow di scansione in 3 fasi
+#   Fase 1: full TCP SYN scan (-p- -sS) su tutte le 65535 porte
+#   Fase 2: version detection + NSE default (-sCV) SOLO sulle porte aperte
+#   Fase 3: UDP top 100 (-sU -sV)
+#
+# Modalità:
+#   sequenziale (default) — un solo stream, timing conservativo.
+#   parallela  (-P)       — porte divise in blocchi concorrenti + UDP in
+#                           parallelo al TCP. Job auto-rilevati dai core
+#                           (cap 8) o forzati con -j N.
+#
+# Garanzie anti-perdita (entrambe le modalità):
+#   * -Pn          : un host che blocca il ping NON viene saltato.
+#   * auto-verifica: ogni scansione è valida solo se nmap segnala "Nmap done";
+#                    altrimenti viene ritentata (timing più conservativo).
+#   * niente merge silenzioso di dati parziali: i range non confermati sono
+#                    elencati e lo script esce con codice != 0.
+#
+# Opzioni:
+#   -P/-S        modalità parallela / sequenziale (default: sequenziale)
+#   -j N         numero di job in parallelo (implica -P; 0 = auto)
+#   -r           resume: salta le scansioni già completate (Nmap done)
+#   -f FILE      multitarget: una riga per host, "IP [nome]" (# = commento)
+#   -v           verbose: stampa i comandi lanciati
+#
+# Uso: ./whatsthis [-v] [-P|-S] [-j N] [-r] <IP> <nome>
+#      ./whatsthis [opzioni] -f targets.txt
+# Es.: ./whatsthis 10.10.10.5 box01            # singolo, sequenziale
+#      ./whatsthis -P 10.10.10.5 box01         # parallelo (auto-job)
+#      ./whatsthis -P -r -f targets.txt        # multitarget, parallelo, resume
+#
+# Output: tutto dentro la cartella ./<nome>/
+#   quick.txt      — quick-win top 1000 (foothold immediato)
+#   allports.txt   — full TCP
+#   deep.txt       — version detection + NSE
+#   udp.txt        — UDP top 100
+#   next-steps.txt — comandi di enumerazione suggeriti per servizio
+#   summary.md     — report Markdown (riusabile nel report OSCP)
+#
+set -uo pipefail
+
+# --- Colori ---
+RED=$'\e[31m'; GREEN=$'\e[32m'; YELLOW=$'\e[33m'; BLUE=$'\e[34m'; CYAN=$'\e[36m'; BOLD=$'\e[1m'; RST=$'\e[0m'
+
+err()  { printf '%s[!]%s %s\n' "$RED"   "$RST" "$*" >&2; }
+info() { printf '%s[*]%s %s\n' "$BLUE"  "$RST" "$*"; }
+ok()   { printf '%s[+]%s %s\n' "$GREEN" "$RST" "$*"; }
+warn() { printf '%s[!]%s %s\n' "$YELLOW" "$RST" "$*" >&2; }
+
+VERBOSE=0
+MODE="seq"        # seq | par
+JOBS=0            # 0 = auto
+RESUME=0          # 1 = salta le scansioni già completate (Nmap done)
+TARGETFILE=""     # file con lista target (-f)
+INCOMPLETE=0      # diventa 1 se un range non viene confermato (per-target)
+UNVERIFIED=()     # range/scansioni non confermate (per-target)
+OVERALL_FAIL=0    # 1 se almeno un target è incompleto
+MAX_TRIES=3
+
+# Esegue un comando in foreground; in verbose lo stampa prima.
+run() {
+    if (( VERBOSE )); then
+        printf '%s[>]%s %s%s%s\n' "$CYAN" "$RST" "$BOLD" "$*" "$RST" >&2
+    fi
+    "$@"
+}
+
+# --- Parsing argomenti ---
+POSARGS=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -v|--verbose)    VERBOSE=1; shift ;;
+        -P|--parallel)   MODE="par"; shift ;;
+        -S|--sequential) MODE="seq"; shift ;;
+        -j|--jobs)
+            [[ $# -ge 2 ]] || { err "-j richiede un numero"; exit 1; }
+            JOBS="$2"; MODE="par"; shift 2 ;;
+        -r|--resume)     RESUME=1; shift ;;
+        -f|--file)
+            [[ $# -ge 2 ]] || { err "-f richiede un file"; exit 1; }
+            TARGETFILE="$2"; shift 2 ;;
+        -h|--help)
+            awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"
+            exit 0 ;;
+        --) shift; while [[ $# -gt 0 ]]; do POSARGS+=("$1"); shift; done ;;
+        -*) err "Opzione sconosciuta: $1"; exit 1 ;;
+        *)  POSARGS+=("$1"); shift ;;
+    esac
+done
+set -- ${POSARGS[@]+"${POSARGS[@]}"}
+
+if ! [[ "$JOBS" =~ ^[0-9]+$ ]]; then
+    err "Numero di job non valido: $JOBS"
+    exit 1
+fi
+
+# Verifica nmap installato
+if ! command -v nmap >/dev/null 2>&1; then
+    err "nmap non trovato nel PATH. Installalo prima di procedere."
+    exit 1
+fi
+
+# Validazione formato IPv4 (controllo base sui range degli ottetti)
+validate_ip() {
+    local ip="$1" o a b c d
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    IFS='.' read -r a b c d <<< "$ip"
+    for o in "$a" "$b" "$c" "$d"; do (( o > 255 )) && return 1; done
+    return 0
+}
+
+# --- Costruzione lista target: "IP|nome" ---
+TARGETS=()
+if [[ -n "$TARGETFILE" ]]; then
+    [[ -f "$TARGETFILE" ]] || { err "File target non trovato: $TARGETFILE"; exit 1; }
+    while read -r tip tname _; do
+        [[ -z "$tip" || "$tip" == \#* ]] && continue
+        if ! validate_ip "$tip"; then
+            warn "IP non valido in $TARGETFILE: '$tip' (salto)"; continue
+        fi
+        [[ -z "$tname" ]] && tname="$tip"
+        TARGETS+=("$tip|$tname")
+    done < "$TARGETFILE"
+    [[ ${#TARGETS[@]} -gt 0 ]] || { err "Nessun target valido in $TARGETFILE"; exit 1; }
+    info "Target dal file: ${BOLD}${#TARGETS[@]}${RST}"
+else
+    if [[ $# -ne 2 ]]; then
+        err "Uso: $0 [-v] [-P|-S] [-j N] [-r] <IP> <nome>"
+        err "     $0 [opzioni] -f targets.txt"
+        exit 1
+    fi
+    validate_ip "$1" || { err "IP non valido: $1"; exit 1; }
+    TARGETS+=("$1|$2")
+fi
+
+# Rileva quanti job paralleli reggere (cap 8: oltre, il rate-limiting del
+# target inizia a scartare pacchetti = porte perse).
+detect_jobs() {
+    local n=""
+    if command -v nproc >/dev/null 2>&1; then
+        n=$(nproc 2>/dev/null)
+    elif command -v sysctl >/dev/null 2>&1; then
+        n=$(sysctl -n hw.ncpu 2>/dev/null)
+    fi
+    [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 1 )) || n=4
+    (( n > 8 )) && n=8
+    printf '%s' "$n"
+}
+
+# Una scansione nmap è "completa" solo se ha scritto il footer "Nmap done".
+scan_complete() { grep -q '^# Nmap done' "$1" 2>/dev/null; }
+
+# In modalità resume (-r): salta se l'output esiste ed è già completo.
+skip_if_done() {
+    (( RESUME )) || return 1
+    scan_complete "$1" || return 1
+    ok "Resume: salto ${2} (già completo: ${1})."
+    return 0
+}
+
+# ============================================================
+# Risoluzione nome host
+# ============================================================
+resolve_hostname() {
+    local rev=""
+    if command -v dig >/dev/null 2>&1; then
+        rev=$(dig +short -x "$IP" 2>/dev/null | sed 's/\.$//' | head -n1)
+    elif command -v host >/dev/null 2>&1; then
+        rev=$(host "$IP" 2>/dev/null | awk '/pointer/ {sub(/\.$/,"",$NF); print $NF; exit}')
+    elif command -v nslookup >/dev/null 2>&1; then
+        rev=$(nslookup "$IP" 2>/dev/null | awk -F'= ' '/name =/ {sub(/\.$/,"",$2); print $2; exit}')
+    fi
+    [[ -n "$rev" ]] && info "Reverse DNS: ${BOLD}${IP}${RST} -> ${BOLD}${rev}${RST}"
+
+    if grep -qE "^[[:space:]]*${IP//./\\.}[[:space:]]" /etc/hosts 2>/dev/null; then
+        local existing
+        existing=$(grep -E "^[[:space:]]*${IP//./\\.}[[:space:]]" /etc/hosts | awk '{$1=""; sub(/^ /,""); print}')
+        ok "${IP} già presente in /etc/hosts come: ${BOLD}${existing}${RST}"
+        TARGET="${existing%% *}"   # primo hostname mappato
+        return
+    fi
+
+    [[ -t 0 ]] || return
+
+    local default_host="${rev:-$NAME}"
+    printf '%s[?]%s Vuoi mappare %s a un nome in /etc/hosts? [y/N] ' "$YELLOW" "$RST" "$BOLD$IP$RST"
+    local ans; read -r ans
+    [[ "$ans" =~ ^[yYsS] ]] || return
+
+    printf '%s[?]%s Nome host [%s]: ' "$YELLOW" "$RST" "$default_host"
+    local host; read -r host
+    host="${host:-$default_host}"
+
+    if [[ -z "$host" ]]; then
+        err "Nessun nome fornito, salto /etc/hosts."
+        return
+    fi
+
+    info "Aggiungo a /etc/hosts (richiede sudo)..."
+    if printf '%s\t%s\n' "$IP" "$host" | run sudo tee -a /etc/hosts >/dev/null; then
+        ok "Ora puoi usare ${BOLD}${host}${RST} al posto di ${IP}."
+        TARGET="$host"
+    else
+        err "Impossibile scrivere /etc/hosts."
+    fi
+}
+
+# ============================================================
+# Scansione TCP affidabile di un range: ritenta finché "Nmap done".
+# Ritorna 0 se completata, 1 se dopo MAX_TRIES è ancora incompleta.
+# ============================================================
+scan_range_reliable() {
+    local range="$1" out="$2" t timing
+    skip_if_done "$out" "range $range" && return 0
+    for (( t=1; t<=MAX_TRIES; t++ )); do
+        timing="-T4"; (( t > 1 )) && timing="-T3"   # retry più cauto
+        run sudo nmap -p"$range" -sS -Pn "$timing" --max-retries 6 -oN "$out" "$IP" >/dev/null
+        if scan_complete "$out"; then
+            (( t > 1 )) && ok "Range ${range}: completato al tentativo ${t}."
+            return 0
+        fi
+        warn "Range ${range}: scansione incompleta (tentativo ${t}/${MAX_TRIES})."
+    done
+    return 1
+}
+
+# ============================================================
+# Fase 1 parallela — blocchi concorrenti auto-verificati
+# ============================================================
+parallel_tcp_scan() {
+    local jobs="$1"
+    mkdir -p "$CHUNKDIR"
+    (( RESUME )) || rm -f "$CHUNKDIR"/chunk_*.txt   # in resume conservo i chunk già completi
+    local total=65535 start=1 i=0 per
+    per=$(( (total + jobs - 1) / jobs ))
+    local pids=() ranges=() files=()
+    info "Fase 1/3 — Full TCP SYN in ${BOLD}${jobs}${RST} blocchi paralleli (~${per} porte/blocco)..."
+    while (( start <= total )); do
+        local end=$(( start + per - 1 )); (( end > total )) && end=$total
+        local cf; cf="$CHUNKDIR/chunk_$(printf '%02d' "$i").txt"
+        scan_range_reliable "${start}-${end}" "$cf" &   # ogni blocco si auto-ripara
+        local pid="$!"
+        pids+=("$pid"); ranges+=("${start}-${end}"); files+=("$cf")
+        info "  blocco $((i+1)): porte ${start}-${end} (pid ${pid})"
+        start=$(( end + 1 )); i=$(( i + 1 ))
+    done
+
+    # Attendo ogni blocco e fondo SOLO quelli confermati.
+    : > "$ALLPORTS"
+    local idx=0
+    for pid in "${pids[@]}"; do
+        if wait "$pid"; then
+            cat "${files[$idx]}" >> "$ALLPORTS"
+        else
+            err "Range ${ranges[$idx]} NON confermato dopo ${MAX_TRIES} tentativi."
+            UNVERIFIED+=("${ranges[$idx]}")
+            INCOMPLETE=1
+        fi
+        idx=$(( idx + 1 ))
+    done
+}
+
+# ============================================================
+# UDP affidabile (auto-verifica + retry)
+# ============================================================
+udp_scan_reliable() {
+    local t
+    skip_if_done "$UDP" "UDP scan" && return 0
+    for (( t=1; t<=2; t++ )); do
+        run sudo nmap -sU -sV -Pn --top-ports 100 -T3 --max-retries 4 -oN "$UDP" "$IP" >/dev/null
+        if scan_complete "$UDP"; then return 0; fi
+        warn "UDP: scansione incompleta (tentativo ${t}/2)."
+    done
+    return 1
+}
+
+# ============================================================
+# Fase 2 — Version detection + NSE default sulle porte aperte
+# ============================================================
+phase2_deep() {
+    local ports="$1" t
+    skip_if_done "$DEEP" "Fase 2 (-sCV)" && { ok "Output dettagliato: $DEEP"; return 0; }
+    info "Fase 2/3 — Version detection + script default (-sCV) sulle porte: ${ports}"
+    for (( t=1; t<=2; t++ )); do
+        run sudo nmap -p"$ports" -sCV -Pn -T3 --max-retries 5 -oN "$DEEP" "$IP"
+        if scan_complete "$DEEP"; then ok "Output dettagliato: $DEEP"; return 0; fi
+        warn "Fase 2: incompleta (tentativo ${t}/2)."
+    done
+    UNVERIFIED+=("Fase 2 (-sCV)"); INCOMPLETE=1
+    return 1
+}
+
+extract_ports() {
+    grep -hE '^[0-9]+/tcp[[:space:]]+open' "$ALLPORTS" 2>/dev/null \
+        | cut -d/ -f1 | sort -n -u | paste -sd, -
+}
+
+print_open_table() {
+    echo
+    printf '%s%s%s\n' "$YELLOW" "  PORT      STATE   SERVICE" "$RST"
+    grep -hE '^[0-9]+/tcp[[:space:]]+open' "$ALLPORTS" | sort -n -u | sed 's/^/  /'
+    echo
+}
+
+# ============================================================
+# Quick-win — top 1000 porte per un foothold immediato
+# ============================================================
+quick_scan() {
+    local t
+    skip_if_done "$QUICK" "quick scan" && return 0
+    info "Fase 0 — Quick scan (top 1000, -sS) per un foothold immediato..."
+    for (( t=1; t<=2; t++ )); do
+        run sudo nmap --top-ports 1000 -sS -Pn -T4 --max-retries 4 -oN "$QUICK" "$IP" >/dev/null
+        if scan_complete "$QUICK"; then
+            local qp
+            qp=$(grep -hE '^[0-9]+/tcp[[:space:]]+open' "$QUICK" | cut -d/ -f1 | sort -n -u | paste -sd, -)
+            [[ -n "$qp" ]] && ok "Quick-win — porte note già aperte: ${BOLD}${qp}${RST}" \
+                           || info "Quick scan: nessuna delle top-1000 aperta (il full scan continua)."
+            return 0
+        fi
+        warn "Quick scan: incompleto (tentativo ${t}/2)."
+    done
+    return 1
+}
+
+# ============================================================
+# Suggerimenti di enumerazione per un singolo servizio (output su stdout).
+# OSCP-safe: solo enum/ricognizione, nessuna exploitation automatica.
+# ============================================================
+emit_suggestions() {
+    local port="$1" svc="$2" ver="$3" t="$TARGET"
+    printf '## %s/tcp — %s %s\n' "$port" "$svc" "$ver"
+    case "$svc" in
+        *ssl*http*|*https*|https)
+            local url="https://$t:$port"
+            printf '  whatweb %s\n  curl -sik %s/\n' "$url" "$url"
+            printf '  feroxbuster -k -u %s -w /usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt\n' "$url"
+            printf '  nikto -h %s\n' "$url"
+            printf '  sslscan %s:%s\n' "$t" "$port" ;;
+        *http*)
+            local url="http://$t:$port"
+            printf '  whatweb %s\n  curl -sik %s/robots.txt\n' "$url" "$url"
+            printf '  feroxbuster -u %s -w /usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt\n' "$url"
+            printf '  nikto -h %s\n' "$url"
+            printf '  gobuster vhost -u %s --append-domain -w /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt\n' "$url" ;;
+        ftp)
+            printf '  ftp %s        # prova anonymous / anonymous\n' "$t"
+            printf '  nmap -p%s --script ftp-anon,ftp-syst %s\n' "$port" "$t" ;;
+        ssh)
+            printf '  ssh user@%s   # annota versione per CVE note\n' "$t"
+            printf '  nmap -p%s --script ssh2-enum-algos,ssh-auth-methods %s\n' "$port" "$t" ;;
+        smtp|*smtp*)
+            printf '  nmap -p%s --script smtp-commands,smtp-enum-users %s\n' "$port" "$t"
+            printf '  smtp-user-enum -M VRFY -U users.txt -t %s\n' "$t" ;;
+        domain|*dns*)
+            printf '  dig axfr @%s <dominio>   # zone transfer\n' "$t"
+            printf '  dnsenum %s\n' "$t" ;;
+        *netbios*|*microsoft-ds*|*smb*)
+            printf '  enum4linux-ng -A %s\n' "$t"
+            printf '  smbclient -L //%s/ -N\n  smbmap -H %s\n' "$t" "$t"
+            printf '  nmap -p%s --script smb-os-discovery,smb-enum-shares,smb-vuln-* %s\n' "$port" "$t" ;;
+        *msrpc*)
+            printf '  rpcclient -U "" -N %s   # poi: enumdomusers, querydispinfo\n' "$t" ;;
+        *ldap*)
+            printf '  ldapsearch -x -H ldap://%s -s base namingcontexts\n' "$t"
+            printf '  nmap -p%s --script ldap-rootdse %s\n' "$port" "$t" ;;
+        *kerberos*)
+            printf '  # AD/DC probabile. Con utenti: GetNPUsers / kerbrute userenum\n'
+            printf '  kerbrute userenum -d <dominio> --dc %s users.txt\n' "$t" ;;
+        *ms-sql*|*mssql*)
+            printf '  impacket-mssqlclient <user>@%s -windows-auth\n' "$t"
+            printf '  nmap -p%s --script ms-sql-info,ms-sql-empty-password %s\n' "$port" "$t" ;;
+        mysql|*mysql*)
+            printf '  mysql -h %s -u root           # prova password vuota\n' "$t"
+            printf '  nmap -p%s --script mysql-empty-password,mysql-info %s\n' "$port" "$t" ;;
+        postgresql|*postgres*)
+            printf '  psql -h %s -U postgres        # prova postgres/postgres\n' "$t" ;;
+        *ms-wbt*|*rdp*)
+            printf '  xfreerdp /v:%s /u:user /p:pass +clipboard\n' "$t"
+            printf '  nmap -p%s --script rdp-ntlm-info %s\n' "$port" "$t" ;;
+        *vnc*)
+            printf '  vncviewer %s:%s\n' "$t" "$port"
+            printf '  nmap -p%s --script vnc-info,realvnc-auth-bypass %s\n' "$port" "$t" ;;
+        *redis*)
+            printf '  redis-cli -h %s          # info; config get dir\n' "$t" ;;
+        *mongo*)
+            printf '  mongosh --host %s --port %s\n' "$t" "$port" ;;
+        *)
+            case "$port" in
+                5985|5986) printf '  evil-winrm -i %s -u user -p pass   # WinRM\n' "$t" ;;
+                *) printf '  nmap -p%s -sCV --script "default,safe" %s\n' "$port" "$t" ;;
+            esac ;;
+    esac
+    [[ -n "$ver" ]] && printf '  searchsploit %s\n' "$ver"
+    echo
+}
+
+# Genera next-steps.txt dai servizi rilevati (usa il deep scan se disponibile).
+generate_next_steps() {
+    local src="$DEEP"
+    [[ -s "$src" ]] || src="$ALLPORTS"
+    {
+        printf '# whatsthis — next steps per %s (%s)\n' "$TARGET" "$IP"
+        printf '# generato: %s\n# (solo enumerazione — OSCP-safe)\n\n' "$(date '+%F %T')"
+        while read -r line; do
+            local port svc ver
+            port=$(printf '%s' "$line" | cut -d/ -f1)
+            svc=$(printf '%s' "$line" | awk '{print $3}')
+            ver=$(printf '%s' "$line" | awk '{$1=$2=$3=""; sub(/^ +/,""); print}')
+            emit_suggestions "$port" "$svc" "$ver"
+        done < <(grep -hE '^[0-9]+/tcp[[:space:]]+open' "$src" | sort -n -u)
+    } > "$NEXT"
+    ok "Suggerimenti di enumerazione: ${BOLD}${NEXT}${RST}"
+}
+
+# Genera summary.md riutilizzabile nel report OSCP.
+generate_summary() {
+    {
+        printf '# %s — %s\n\n' "$NAME" "$IP"
+        [[ "$TARGET" != "$IP" ]] && printf '**Hostname:** %s\n\n' "$TARGET"
+        printf '_Scan: %s · whatsthis_\n\n' "$(date '+%F %T')"
+
+        printf '## Porte TCP aperte\n\n'
+        printf '| Porta | Stato | Servizio | Versione |\n|------:|:-----:|----------|----------|\n'
+        local src="$DEEP"; [[ -s "$src" ]] || src="$ALLPORTS"
+        grep -hE '^[0-9]+/tcp[[:space:]]+open' "$src" | sort -n -u | awk '{
+            port=$1; state=$2; svc=$3; $1=$2=$3=""; sub(/^ +/,"");
+            printf "| %s | %s | %s | %s |\n", port, state, svc, $0
+        }'
+
+        if grep -qhE '^[0-9]+/udp[[:space:]]+open' "$UDP" 2>/dev/null; then
+            printf '\n## UDP (top 100)\n\n'
+            printf '| Porta | Stato | Servizio |\n|------:|:-----:|----------|\n'
+            grep -hE '^[0-9]+/udp[[:space:]]+(open|open\|filtered)' "$UDP" | sort -n -u | awk '{
+                printf "| %s | %s | %s |\n", $1, $2, $3
+            }'
+        fi
+
+        printf '\n## File generati\n\n'
+        printf -- '- `%s` — full TCP\n' "$ALLPORTS"
+        [[ -s "$DEEP" ]]  && printf -- '- `%s` — version + NSE\n' "$DEEP"
+        printf -- '- `%s` — UDP top 100\n' "$UDP"
+        printf -- '- `%s` — next steps\n' "$NEXT"
+    } > "$SUMMARY"
+    ok "Report Markdown: ${BOLD}${SUMMARY}${RST}"
+}
+
+# ============================================================
+# Scansione completa di un singolo target
+# ============================================================
+scan_target() {
+    IP="$1"; NAME="$2"
+    OUTDIR="$NAME"; CHUNKDIR="$OUTDIR/.chunks"
+    QUICK="$OUTDIR/quick.txt"; ALLPORTS="$OUTDIR/allports.txt"
+    DEEP="$OUTDIR/deep.txt"; UDP="$OUTDIR/udp.txt"
+    NEXT="$OUTDIR/next-steps.txt"; SUMMARY="$OUTDIR/summary.md"
+    TARGET="$IP"          # diventa l'hostname se mappato in /etc/hosts
+    INCOMPLETE=0; UNVERIFIED=()
+    mkdir -p "$OUTDIR"
+
+    printf '\n%s%s═══ %s → %s/ ═══%s\n' "$BOLD" "$BLUE" "$IP" "$OUTDIR" "$RST"
+
+    resolve_hostname
+
+    echo
+    quick_scan
+    echo
+
+    local ports="" udp_pid
+    if [[ "$MODE" == "par" ]]; then
+        (( JOBS == 0 )) && JOBS=$(detect_jobs)
+        ok "Modalità ${BOLD}PARALLELA${RST} — ${JOBS} job (auto-tuned sui core, cap 8)."
+
+        info "Avvio in parallelo lo UDP scan (top 100, -sU -sV)..."
+        udp_scan_reliable &
+        udp_pid="$!"
+
+        parallel_tcp_scan "$JOBS"
+        ports=$(extract_ports)
+
+        echo
+        if [[ -z "$ports" ]]; then
+            warn "Nessuna porta TCP aperta confermata. Salto la Fase 2."
+            (( INCOMPLETE )) || warn "In dubbio, riesegui in sequenziale (-S) per conferma."
+        else
+            ok "Porte TCP aperte: ${BOLD}${ports}${RST}"
+            print_open_table
+            phase2_deep "$ports"
+        fi
+
+        echo
+        info "Attendo il completamento dello UDP scan..."
+        if wait "$udp_pid"; then
+            ok "Output UDP: $UDP"
+        else
+            err "UDP scan non confermato."
+            UNVERIFIED+=("UDP top 100"); INCOMPLETE=1
+        fi
+    else
+        ok "Modalità ${BOLD}SEQUENZIALE${RST} — massima affidabilità (anti-porte-perse)."
+
+        info "Fase 1/3 — Full TCP SYN scan (-p- -sS) su ${BOLD}${IP}${RST}..."
+        if ! scan_range_reliable "1-65535" "$ALLPORTS"; then
+            err "Full TCP scan NON confermato dopo ${MAX_TRIES} tentativi."
+            UNVERIFIED+=("1-65535"); INCOMPLETE=1
+        fi
+        ports=$(extract_ports)
+
+        echo
+        if [[ -z "$ports" ]]; then
+            warn "Nessuna porta TCP aperta confermata. Salto la Fase 2."
+        else
+            ok "Porte TCP aperte: ${BOLD}${ports}${RST}"
+            print_open_table
+            phase2_deep "$ports"
+        fi
+
+        echo
+        info "Fase 3/3 — UDP scan (top 100, -sU -sV)... (può richiedere parecchio)"
+        if udp_scan_reliable; then
+            ok "Output UDP: $UDP"
+        else
+            err "UDP scan non confermato."
+            UNVERIFIED+=("UDP top 100"); INCOMPLETE=1
+        fi
+    fi
+
+    # --- Report per-target ---
+    echo
+    [[ -n "$ports" ]] && generate_next_steps
+    generate_summary
+
+    echo
+    ok "File in ${BOLD}${OUTDIR}/${RST}:"
+    printf '   - %s  (full TCP)\n' "$ALLPORTS"
+    [[ -n "$ports" ]] && printf '   - %s  (version + NSE)\n' "$DEEP"
+    printf '   - %s  (UDP top 100)\n' "$UDP"
+    [[ -n "$ports" ]] && printf '   - %s  (next steps)\n' "$NEXT"
+    printf '   - %s  (report markdown)\n' "$SUMMARY"
+
+    if (( INCOMPLETE )); then
+        echo
+        err "[$IP] ATTENZIONE: scansioni NON confermate (possibili porte perse):"
+        for u in "${UNVERIFIED[@]}"; do err "   - $u"; done
+        OVERALL_FAIL=1
+        return 1
+    fi
+    ok "[$IP] Tutte le scansioni confermate (Nmap done). Nessuna porta persa."
+    return 0
+}
+
+# ============================================================
+# Esecuzione
+# ============================================================
+info "Richiedo privilegi (sudo) per i SYN/UDP scan..."
+run sudo -v || { err "sudo necessario per -sS / -sU."; exit 1; }
+
+for entry in "${TARGETS[@]}"; do
+    scan_target "${entry%%|*}" "${entry#*|}"
+done
+
+echo
+if (( OVERALL_FAIL )); then
+    err "Una o più scansioni risultano incomplete. Controlla gli avvisi sopra (riprova con -S o -r)."
+    exit 2
+fi
+ok "Completato: ${BOLD}${#TARGETS[@]}${RST} target, tutte le scansioni confermate."
