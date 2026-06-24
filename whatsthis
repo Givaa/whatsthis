@@ -67,6 +67,26 @@ run() {
     "$@"
 }
 
+# Banner ASCII di avvio (lente d'ingrandimento — "what's this?").
+banner() {
+    printf '%s' "$CYAN"
+    cat <<'EOF'
+              _____
+            ,'     ',
+           /  ,---.  \
+          |  /     \  |        __        __         _   _   _     _     ___
+          | |       | |        \ \      / /_ _ __ _| |_| |_| |__ (_)___|__ \
+          | |       | |         \ \ /\ / / _` / _` | __| __| '_ \| / __|  / /
+          |  \     /  |          \ V  V / (_| \__,_| |_| |_| | | | \__ \ |_|
+           \  '---'  /            \_/\_/ \__,_|\__,_|\__|\__|_| |_|_|___/ (_)
+            ',_____,'
+                \  \
+                 \  '.        nmap recon · 3 fasi · anti-perdita di porte
+                  '---'
+EOF
+    printf '%s\n' "$RST"
+}
+
 # --- Parsing argomenti ---
 POSARGS=()
 while [[ $# -gt 0 ]]; do
@@ -101,6 +121,8 @@ if ! command -v nmap >/dev/null 2>&1; then
     err "nmap non trovato nel PATH. Installalo prima di procedere."
     exit 1
 fi
+
+banner
 
 # Validazione formato IPv4 (controllo base sui range degli ottetti)
 validate_ip() {
