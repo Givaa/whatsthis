@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
 # whatsthis — Workflow di scansione in 3 fasi
+# Autore: Giva
 #   Fase 1: full TCP SYN scan (-p- -sS) su tutte le 65535 porte
 #   Fase 2: version detection + NSE default (-sCV) SOLO sulle porte aperte
 #   Fase 3: UDP top 100 (-sU -sV)
@@ -81,7 +82,7 @@ banner() {
          !.........||||                     ||||        \_/\_/ |_||_\__,_|\__/__/ |_| |_||_|_/__/(_) 
          !.........||||                     ||||
          !.........||||                     ||||      nmap automator
-         !.........||||                     ||||
+         !.........||||                     ||||      by Giva
          `.........||||                    ,||||
           .;.......||||               \_.-!!|||||
    .,uodWBBBBb.....||||       \_.-!!|||||||||!:'
