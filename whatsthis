@@ -81,7 +81,7 @@ banner() {
            \  '---'  /            \_/\_/ \__,_|\__,_|\__|\__|_| |_|_|___/ (_)
             ',_____,'
                 \  \
-                 \  '.        nmap recon · 3 fasi · anti-perdita di porte
+                 \  '.        nmap automator · 3 fasi
                   '---'
 EOF
     printf '%s\n' "$RST"
