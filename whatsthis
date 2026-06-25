@@ -12,6 +12,11 @@
 #                           parallelo al TCP. Job auto-rilevati dai core
 #                           (cap 8) o forzati con -j N.
 #
+# /etc/hosts:
+#   * pre-scan: reverse DNS + mappatura opzionale
+#   * post-scan: estrae gli hostname dai servizi (smb/ssl-cert/http/ldap/PTR)
+#     e propone di aggiungerli (gestisce alias multipli e dedup, idempotente)
+#
 # Garanzie anti-perdita (entrambe le modalità):
 #   * -Pn          : un host che blocca il ping NON viene saltato.
 #   * auto-verifica: ogni scansione è valida solo se nmap segnala "Nmap done";
@@ -202,8 +207,77 @@ skip_if_done() {
 }
 
 # ============================================================
-# Risoluzione nome host
+# Gestione /etc/hosts
 # ============================================================
+
+# Hostname valido: lettere/cifre/.-_ con almeno una lettera (esclude gli IP).
+valid_hostname() {
+    local h="$1"
+    [[ "$h" =~ ^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$ ]] || return 1
+    [[ "$h" =~ [A-Za-z] ]] || return 1
+    return 0
+}
+
+# Nomi già mappati a un IP in /etc/hosts (uno per riga), ignorando i commenti.
+hosts_names_for_ip() {
+    grep -E "^[[:space:]]*${1//./\\.}[[:space:]]" /etc/hosts 2>/dev/null \
+        | sed 's/#.*//' | awk '{$1=""; print}' | tr -s '[:space:]' '\n' | awk 'NF' | sort -u
+}
+
+# Aggiunge a /etc/hosts i nomi nuovi/validi per un IP. Gestisce tutti i casi:
+#  - validazione del nome, dedup, nomi già presenti (idempotente)
+#  - IP già mappato  -> aggiunge solo gli alias mancanti
+#  - conferma interattiva; in modalità non interattiva NON tocca il file
+#  - imposta TARGET al primo nome se è ancora uguale all'IP
+add_to_hosts() {
+    local ip="$1"; shift
+    local existing new=() n m seen
+    existing=" $(hosts_names_for_ip "$ip" | tr '\n' ' ') "
+    for n in "$@"; do
+        n=$(printf '%s' "$n" | tr 'A-Z' 'a-z')
+        valid_hostname "$n" || continue
+        [[ "$n" == "$ip" ]] && continue
+        [[ "$existing" == *" $n "* ]] && continue
+        seen=0; for m in ${new[@]+"${new[@]}"}; do [[ "$m" == "$n" ]] && seen=1; done
+        (( seen )) || new+=("$n")
+    done
+    [[ ${#new[@]} -eq 0 ]] && return 1
+
+    if [[ ! -t 0 ]]; then
+        info "Non interattivo: non modifico /etc/hosts (candidati: ${new[*]})."
+        return 1
+    fi
+    printf '%s[?]%s Aggiungo a /etc/hosts  %s%s -> %s%s ? [Y/n] ' \
+        "$YELLOW" "$RST" "$BOLD" "$ip" "${new[*]}" "$RST"
+    local ans; read -r ans
+    [[ "$ans" =~ ^[nN] ]] && { info "Salto /etc/hosts."; return 1; }
+
+    if printf '%s\t%s\n' "$ip" "${new[*]}" | run sudo tee -a /etc/hosts >/dev/null; then
+        ok "Aggiunto a /etc/hosts: ${BOLD}${ip} ${new[*]}${RST}"
+        [[ "$TARGET" == "$ip" ]] && TARGET="${new[0]}"
+        return 0
+    fi
+    err "Impossibile scrivere /etc/hosts."
+    return 1
+}
+
+# Estrae hostname candidati dall'output nmap (smb, ssl-cert, http, ldap, PTR).
+extract_hostnames() {
+    local f="$1"
+    [[ -s "$f" ]] || return
+    {
+        grep -iE 'FQDN|DNS_Computer_Name|DNS_Domain_Name|NetBIOS_Domain_Name|Computer name|Domain name|NetBIOS computer name' "$f" \
+            | sed -E 's/.*:[[:space:]]*//'
+        grep -oiE 'commonName=[A-Za-z0-9.*_-]+' "$f" | sed -E 's/commonName=//I'
+        grep -oiE 'DNS:[A-Za-z0-9.*_-]+'        "$f" | sed -E 's/DNS://I'
+        grep -oiE 'https?://[A-Za-z0-9._-]+'    "$f" | sed -E 's#https?://##I'
+        grep -oiE 'Nmap scan report for [A-Za-z0-9._-]+' "$f" | sed -E 's/.*for //I'
+    } 2>/dev/null \
+        | sed -E 's/^\*\.//; s/^[.-]+//; s/[.,;]+$//' \
+        | tr 'A-Z' 'a-z' | awk 'NF' | sort -u
+}
+
+# Reverse DNS + mappatura iniziale (prima dello scan).
 resolve_hostname() {
     local rev=""
     if command -v dig >/dev/null 2>&1; then
@@ -215,37 +289,26 @@ resolve_hostname() {
     fi
     [[ -n "$rev" ]] && info "Reverse DNS: ${BOLD}${IP}${RST} -> ${BOLD}${rev}${RST}"
 
-    if grep -qE "^[[:space:]]*${IP//./\\.}[[:space:]]" /etc/hosts 2>/dev/null; then
-        local existing
-        existing=$(grep -E "^[[:space:]]*${IP//./\\.}[[:space:]]" /etc/hosts | awk '{$1=""; sub(/^ /,""); print}')
-        ok "${IP} già presente in /etc/hosts come: ${BOLD}${existing}${RST}"
-        TARGET="${existing%% *}"   # primo hostname mappato
-        return
+    local mapped
+    mapped=$(hosts_names_for_ip "$IP" | paste -sd' ' -)
+    if [[ -n "$mapped" ]]; then
+        ok "${IP} già in /etc/hosts come: ${BOLD}${mapped}${RST}"
+        [[ "$TARGET" == "$IP" ]] && TARGET="${mapped%% *}"
     fi
 
-    [[ -t 0 ]] || return
+    local cand="$rev"
+    [[ -z "$cand" && "$NAME" != "$IP" ]] && cand="$NAME"
+    [[ -n "$cand" ]] && add_to_hosts "$IP" "$cand"
+}
 
-    local default_host="${rev:-$NAME}"
-    printf '%s[?]%s Vuoi mappare %s a un nome in /etc/hosts? [y/N] ' "$YELLOW" "$RST" "$BOLD$IP$RST"
-    local ans; read -r ans
-    [[ "$ans" =~ ^[yYsS] ]] || return
-
-    printf '%s[?]%s Nome host [%s]: ' "$YELLOW" "$RST" "$default_host"
-    local host; read -r host
-    host="${host:-$default_host}"
-
-    if [[ -z "$host" ]]; then
-        err "Nessun nome fornito, salto /etc/hosts."
-        return
-    fi
-
-    info "Aggiungo a /etc/hosts (richiede sudo)..."
-    if printf '%s\t%s\n' "$IP" "$host" | run sudo tee -a /etc/hosts >/dev/null; then
-        ok "Ora puoi usare ${BOLD}${host}${RST} al posto di ${IP}."
-        TARGET="$host"
-    else
-        err "Impossibile scrivere /etc/hosts."
-    fi
+# Hostname scoperti dai servizi dopo la Fase 2 -> proposta /etc/hosts.
+discover_hostnames_post() {
+    local names
+    names=$(extract_hostnames "$DEEP")
+    [[ -z "$names" ]] && return
+    info "Hostname rilevati dai servizi: ${BOLD}$(echo "$names" | paste -sd' ' -)${RST}"
+    # shellcheck disable=SC2086
+    add_to_hosts "$IP" $names
 }
 
 # ============================================================
@@ -566,6 +629,12 @@ scan_target() {
             err "UDP scan non confermato."
             UNVERIFIED+=("UDP top 100"); INCOMPLETE=1
         fi
+    fi
+
+    # --- Hostname scoperti dai servizi (dopo la Fase 2) -> /etc/hosts ---
+    if [[ -n "$ports" && -s "$DEEP" ]]; then
+        echo
+        discover_hostnames_post
     fi
 
     # --- Report per-target ---
