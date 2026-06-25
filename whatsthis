@@ -625,7 +625,12 @@ scan_target() {
 # ============================================================
 # Run
 # ============================================================
+# One sudo prompt up front, then keep the timestamp warm so long unattended
+# (background) runs don't re-prompt mid-scan.
 run sudo -v || { err "sudo required for SYN/UDP scans"; exit 1; }
+( while true; do sudo -n true 2>/dev/null; sleep 50; kill -0 "$$" 2>/dev/null || exit; done ) &
+SUDO_KEEPALIVE=$!
+trap 'kill "$SUDO_KEEPALIVE" 2>/dev/null' EXIT
 
 for entry in "${TARGETS[@]}"; do
     scan_target "${entry%%|*}" "${entry#*|}"
