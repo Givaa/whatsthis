@@ -247,15 +247,7 @@ add_to_hosts() {
     done
     [[ ${#new[@]} -eq 0 ]] && return 1
 
-    if [[ ! -t 0 ]]; then
-        info "Non interattivo: non modifico /etc/hosts (candidati: ${new[*]})."
-        return 1
-    fi
-    printf '%s[?]%s Aggiungo a /etc/hosts  %s%s -> %s%s ? [Y/n] ' \
-        "$YELLOW" "$RST" "$BOLD" "$ip" "${new[*]}" "$RST"
-    local ans; read -r ans
-    [[ "$ans" =~ ^[nN] ]] && { info "Salto /etc/hosts."; return 1; }
-
+    # Aggiunta automatica, senza chiedere conferma.
     if printf '%s\t%s\n' "$ip" "${new[*]}" | run sudo tee -a /etc/hosts >/dev/null; then
         ok "Aggiunto a /etc/hosts: ${BOLD}${ip} ${new[*]}${RST}"
         [[ "$TARGET" == "$ip" ]] && TARGET="${new[0]}"
