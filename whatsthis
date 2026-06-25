@@ -29,10 +29,11 @@
 #   -P/-S        modalità parallela / sequenziale (default: sequenziale)
 #   -j N         numero di job in parallelo (implica -P; 0 = auto)
 #   -r           resume: salta le scansioni già completate (Nmap done)
+#   -g, --grant  autorizza tutte le operazioni (/etc/hosts, rinomina) senza chiedere
 #   -f FILE      multitarget: una riga per host, "IP [nome]" (# = commento)
 #   -v           verbose: stampa i comandi lanciati
 #
-# Uso: ./whatsthis [-v] [-P|-S] [-j N] [-r] <IP> [nome]
+# Uso: ./whatsthis [-v] [-P|-S] [-j N] [-r] [-g] <IP> [nome]
 #      ./whatsthis [opzioni] -f targets.txt
 # Es.: ./whatsthis 10.10.10.5                  # solo IP: cartella = IP, nome auto-scoperto
 #      ./whatsthis 10.10.10.5 box01            # singolo, sequenziale
@@ -61,6 +62,7 @@ VERBOSE=0
 MODE="seq"        # seq | par
 JOBS=0            # 0 = auto
 RESUME=0          # 1 = salta le scansioni già completate (Nmap done)
+GRANT=0           # 1 = autorizza tutte le operazioni senza chiedere (--grant)
 TARGETFILE=""     # file con lista target (-f)
 INCOMPLETE=0      # diventa 1 se un range non viene confermato (per-target)
 UNVERIFIED=()     # range/scansioni non confermate (per-target)
@@ -73,6 +75,16 @@ run() {
         printf '%s[>]%s %s%s%s\n' "$CYAN" "$RST" "$BOLD" "$*" "$RST" >&2
     fi
     "$@"
+}
+
+# Chiede conferma per un'operazione. Con --grant (o senza TTY + --grant) procede
+# automaticamente; senza --grant e senza TTY rifiuta (default: No).
+confirm() {
+    (( GRANT )) && return 0
+    [[ -t 0 ]] || return 1
+    printf '%s[?]%s %s [y/N] ' "$YELLOW" "$RST" "$*"
+    local ans; read -r ans
+    [[ "$ans" =~ ^[yYsS] ]]
 }
 
 # Banner ASCII di avvio (lente d'ingrandimento — "what's this?").
@@ -124,6 +136,7 @@ while [[ $# -gt 0 ]]; do
             [[ $# -ge 2 ]] || { err "-j richiede un numero"; exit 1; }
             JOBS="$2"; MODE="par"; shift 2 ;;
         -r|--resume)     RESUME=1; shift ;;
+        -g|--grant)      GRANT=1; shift ;;
         -f|--file)
             [[ $# -ge 2 ]] || { err "-f richiede un file"; exit 1; }
             TARGETFILE="$2"; shift 2 ;;
@@ -175,7 +188,7 @@ if [[ -n "$TARGETFILE" ]]; then
     info "Target dal file: ${BOLD}${#TARGETS[@]}${RST}"
 else
     if [[ $# -lt 1 || $# -gt 2 ]]; then
-        err "Uso: $0 [-v] [-P|-S] [-j N] [-r] <IP> [nome]"
+        err "Uso: $0 [-v] [-P|-S] [-j N] [-r] [-g] <IP> [nome]"
         err "     $0 [opzioni] -f targets.txt"
         exit 1
     fi
@@ -247,7 +260,7 @@ add_to_hosts() {
     done
     [[ ${#new[@]} -eq 0 ]] && return 1
 
-    # Aggiunta automatica, senza chiedere conferma.
+    confirm "Aggiungo a /etc/hosts: ${BOLD}${ip} ${new[*]}${RST} ?" || { info "Salto /etc/hosts."; return 1; }
     if printf '%s\t%s\n' "$ip" "${new[*]}" | run sudo tee -a /etc/hosts >/dev/null; then
         ok "Aggiunto a /etc/hosts: ${BOLD}${ip} ${new[*]}${RST}"
         [[ "$TARGET" == "$ip" ]] && TARGET="${new[0]}"
@@ -311,6 +324,7 @@ rename_outdir() {
         warn "Cartella ${newdir}/ già esistente: non rinomino."
         return
     fi
+    confirm "Rinomino la cartella ${BOLD}${OUTDIR}/ -> ${newdir}/${RST} ?" || { info "Mantengo ${OUTDIR}/."; return; }
     if mv "$OUTDIR" "$newdir" 2>/dev/null; then
         ok "Cartella rinominata: ${BOLD}${OUTDIR}/ -> ${newdir}/${RST}"
         OUTDIR="$newdir"; CHUNKDIR="$OUTDIR/.chunks"
