@@ -10,7 +10,7 @@
          !.........||||                     ||||        \_/\_/ |_||_\__,_|\__/__/ |_| |_||_|_/__/(_)
          !.........||||                     ||||
          !.........||||                     ||||      nmap automator
-         !.........||||                     ||||      by Giva
+         !.........||||                     ||||      by Giva · github.com/Givaa
 ```
 
 **whatsthis** è un automator di ricognizione basato su `nmap`: un singolo script Bash
@@ -122,4 +122,4 @@ alla tua macchina.
 
 ## Autore
 
-Giva
+Giva — [@Givaa](https://github.com/Givaa)
