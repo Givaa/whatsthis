@@ -6,7 +6,8 @@
 #   Fase 2: version detection + NSE default (-sCV) SOLO sulle porte aperte
 #   Fase 3: UDP top 100 (-sU -sV)
 #
-# Barre di avanzamento live (TCP/UDP) durante le scansioni, su terminale.
+# Output di nmap a schermo + stato avanzamento ogni ~15s (--stats-every);
+# in parallelo i blocchi sono silenziosi e lo stato TCP/UDP è una riga di testo.
 #
 # Modalità:
 #   sequenziale (default) — un solo stream, timing conservativo.
@@ -248,7 +249,11 @@ skip_if_done() {
 }
 
 # ============================================================
-# Barre di avanzamento (sfruttano nmap --stats-every)
+# Stato avanzamento (testuale, ~ogni 15s) — niente barre
+#   * sequenziale: l'output di nmap va a schermo (risultati + stato via
+#     --stats-every 15s di nmap stesso)
+#   * parallelo: i blocchi sono silenziosi (su file), quindi stampo io
+#     una riga di stato ogni ~15s leggendo le percentuali
 # ============================================================
 
 # Ultima percentuale "About X% done" da un file di progress nmap (0 se assente).
@@ -258,71 +263,84 @@ nmap_percent() {
     printf '%s' "${p:-0}"
 }
 
-# Percentuale di un singolo scan: 100 se già completo, altrimenti dal progress.
+# Percentuale di uno scan: 100 se completo, altrimenti dal file di progress.
 scan_pct() {
-    local out="$1"
-    scan_complete "$out" && { printf '100'; return; }
-    nmap_percent "${out}.prog"
+    scan_complete "$1" && { printf '100'; return; }
+    nmap_percent "${1}.prog"
 }
 
-# Disegna una barra: <label> <percent> [larghezza]
-draw_bar() {
-    local label="$1" pct="$2" w="${3:-22}" i filled bar=""
-    filled=$(awk -v p="$pct" -v w="$w" 'BEGIN{f=int(p*w/100+0.5); if(f>w)f=w; if(f<0)f=0; print f}')
-    for (( i=0; i<filled; i++ )); do bar+="█"; done
-    for (( i=filled; i<w; i++ )); do bar+="░"; done
-    printf '%s%-4s%s [%s] %5.1f%%' "$BOLD" "$label" "$RST" "$bar" "$pct"
+# % TCP COMPLESSIVA pesata sul numero di porte di ogni blocco (calcolo preciso:
+# porte completate / 65535, non una media grezza dei blocchi).
+tcp_avg_pct() {
+    local i n="${#CHUNK_FILES[@]}" done=0 total=0 start end cnt pct range
+    for (( i=0; i<n; i++ )); do
+        range="${CHUNK_RANGES[$i]}"; start="${range%-*}"; end="${range#*-}"
+        cnt=$(( end - start + 1 ))
+        pct=$(scan_pct "${CHUNK_FILES[$i]}")
+        done=$(awk -v d="$done" -v p="$pct" -v c="$cnt" 'BEGIN{print d + p*c/100}')
+        total=$(( total + cnt ))
+    done
+    awk -v d="$done" -v t="$total" 'BEGIN{printf "%.0f", (t? d/t*100 : 0)}'
 }
 
-# Esegue una scansione nmap mostrando UNA barra live (se stdout è un TTY).
-# $1=label $2=outfile(-oN) $3=progfile  resto=argomenti nmap (senza -oN/--stats-every)
-nmap_bar() {
-    local label="$1" out="$2" prog="$3"; shift 3
-    log_cmd "sudo nmap $* -oN $out $IP"
-    (( VERBOSE )) && printf '%s[>]%s %ssudo nmap %s -oN %s %s%s\n' "$CYAN" "$RST" "$BOLD" "$*" "$out" "$IP" "$RST" >&2
-    : > "$prog"
-    sudo nmap "$@" -oN "$out" --stats-every 2s "$IP" >"$prog" 2>&1 &
-    local pid="$!"
-    if [[ -t 1 ]]; then
-        while kill -0 "$pid" 2>/dev/null; do
-            printf '\r\033[K  '; draw_bar "$label" "$(scan_pct "$out")"
-            sleep 1
-        done
-        printf '\r\033[K  '; draw_bar "$label" 100; printf '\n'
-    fi
-    wait "$pid"
+# Secondi rimanenti riportati da nmap ("(H:MM:SS remaining)") in un file, o vuoto.
+nmap_remaining_secs() {
+    local r
+    r=$(grep -oE '[0-9]+:[0-9]{2}:[0-9]{2} remaining' "$1" 2>/dev/null | tail -n1 | grep -oE '^[0-9:]+')
+    [[ -z "$r" ]] && return 1
+    awk -F: '{print $1*3600+$2*60+$3}' <<< "$r"
 }
 
-# Monitor live per la Fase 1 parallela: barra TCP (media dei blocchi) + barra UDP,
-# finché i blocchi TCP sono vivi. L'UDP prosegue in background.
-monitor_tcp_parallel() {
-    [[ -t 1 ]] || return
-    local alive p sum n tcppct udppct
+# Tempo rimanente TCP in parallelo = MAX dei "remaining" dei blocchi non completi
+# (finisci quando finisce il blocco più lento). Vuoto se non ancora stimabile.
+tcp_remaining_secs() {
+    local p s max=-1
+    for p in ${CHUNK_FILES[@]+"${CHUNK_FILES[@]}"}; do
+        scan_complete "$p" && continue
+        s=$(nmap_remaining_secs "${p}.prog") || continue
+        (( s > max )) && max=$s
+    done
+    (( max < 0 )) && return 1
+    printf '%s' "$max"
+}
+
+# Secondi -> "Mm Ss" o "Hh Mm".
+fmt_secs() {
+    awk -v s="$1" 'BEGIN{
+        h=int(s/3600); m=int((s%3600)/60); sec=int(s%60);
+        if(h>0) printf "%dh %02dm", h, m; else printf "%dm %02ds", m, sec
+    }'
+}
+
+# Stato parallelo UNIFICATO: una sola riga ogni ~15s con % complessiva e ETA.
+status_loop_parallel() {
+    local udp_pid="$1" t=0 alive p rem msg
     while :; do
         alive=0
         for p in ${CHUNK_PIDS[@]+"${CHUNK_PIDS[@]}"}; do kill -0 "$p" 2>/dev/null && alive=1; done
-        sum=0; n=0
-        for p in ${CHUNK_FILES[@]+"${CHUNK_FILES[@]}"}; do
-            sum=$(awk -v s="$sum" -v x="$(scan_pct "$p")" 'BEGIN{print s+x}'); n=$((n+1))
-        done
-        tcppct=$(awk -v s="$sum" -v n="$n" 'BEGIN{printf "%.1f", (n?s/n:0)}')
-        udppct=$(scan_pct "$UDP")
-        printf '\r\033[K  '; draw_bar "TCP" "$tcppct"; printf '   '; draw_bar "UDP" "$udppct"
+        [[ -n "$udp_pid" ]] && kill -0 "$udp_pid" 2>/dev/null && alive=1
         (( alive )) || break
-        sleep 1
+        if (( t % 15 == 0 )); then
+            msg="Avanzamento — TCP $(tcp_avg_pct)%"
+            rem=$(tcp_remaining_secs) && msg+=" (ETA ~$(fmt_secs "$rem"))"
+            [[ -n "$udp_pid" ]] && kill -0 "$udp_pid" 2>/dev/null && msg+=" | UDP $(printf '%.0f' "$(scan_pct "$UDP")")%"
+            info "$msg"
+        fi
+        sleep 1; t=$((t+1))
     done
-    printf '\r\033[K  '; draw_bar "TCP" 100; printf '   '; draw_bar "UDP" "$(scan_pct "$UDP")"; printf '\n'
 }
 
-# Monitor live di una singola scansione in background finché non termina (UDP residuo).
-monitor_one() {
-    local label="$1" out="$2" pid="$3"
-    [[ -t 1 ]] || return
+# Attende un singolo scan in background stampando lo stato ogni ~15s (UDP residuo).
+status_wait() {
+    local label="$1" out="$2" pid="$3" t=0 rem msg
     while kill -0 "$pid" 2>/dev/null; do
-        printf '\r\033[K  '; draw_bar "$label" "$(scan_pct "$out")"
-        sleep 1
+        if (( t % 15 == 0 )); then
+            msg="Avanzamento — ${label} $(printf '%.0f' "$(scan_pct "$out")")%"
+            rem=$(nmap_remaining_secs "${out}.prog") && msg+=" (ETA ~$(fmt_secs "$rem"))"
+            info "$msg"
+        fi
+        sleep 1; t=$((t+1))
     done
-    printf '\r\033[K  '; draw_bar "$label" 100; printf '\n'
 }
 
 # ============================================================
@@ -463,12 +481,14 @@ scan_range_reliable() {
     skip_if_done "$out" "range $range" && return 0
     for (( t=1; t<=MAX_TRIES; t++ )); do
         timing="-T4"; (( t > 1 )) && timing="-T3"   # retry più cauto
+        log_cmd "sudo nmap -p$range -sS -Pn $timing --max-retries 6 -oN $out $IP"
         if [[ -n "$label" ]]; then
-            nmap_bar "$label" "$out" "${out}.prog" -p"$range" -sS -Pn "$timing" --max-retries 6
+            # sequenziale: output a schermo (stato via --stats-every di nmap)
+            run sudo nmap -p"$range" -sS -Pn "$timing" --max-retries 6 -oN "$out" --stats-every 15s "$IP"
         else
-            log_cmd "sudo nmap -p$range -sS -Pn $timing --max-retries 6 -oN $out $IP"
+            # parallelo: silenzioso su file (lo stato lo stampa status_loop_parallel)
             : > "${out}.prog"
-            run sudo nmap -p"$range" -sS -Pn "$timing" --max-retries 6 -oN "$out" --stats-every 2s "$IP" >"${out}.prog" 2>&1
+            run sudo nmap -p"$range" -sS -Pn "$timing" --max-retries 6 -oN "$out" --stats-every 15s "$IP" >"${out}.prog" 2>&1
         fi
         if scan_complete "$out"; then
             (( t > 1 )) && ok "Range ${range}: completato al tentativo ${t}."
@@ -524,12 +544,12 @@ udp_scan_reliable() {
     local label="${1:-}" t
     skip_if_done "$UDP" "UDP scan" && return 0
     for (( t=1; t<=2; t++ )); do
+        log_cmd "sudo nmap -sU -sV -Pn --top-ports 100 -T3 --max-retries 4 -oN $UDP $IP"
         if [[ -n "$label" ]]; then
-            nmap_bar "$label" "$UDP" "${UDP}.prog" -sU -sV -Pn --top-ports 100 -T3 --max-retries 4
+            run sudo nmap -sU -sV -Pn --top-ports 100 -T3 --max-retries 4 -oN "$UDP" --stats-every 15s "$IP"
         else
-            log_cmd "sudo nmap -sU -sV -Pn --top-ports 100 -T3 --max-retries 4 -oN $UDP $IP"
             : > "${UDP}.prog"
-            run sudo nmap -sU -sV -Pn --top-ports 100 -T3 --max-retries 4 -oN "$UDP" --stats-every 2s "$IP" >"${UDP}.prog" 2>&1
+            run sudo nmap -sU -sV -Pn --top-ports 100 -T3 --max-retries 4 -oN "$UDP" --stats-every 15s "$IP" >"${UDP}.prog" 2>&1
         fi
         if scan_complete "$UDP"; then return 0; fi
         warn "UDP: scansione incompleta (tentativo ${t}/2)."
@@ -545,7 +565,8 @@ phase2_deep() {
     skip_if_done "$DEEP" "Fase 2 (-sCV)" && { ok "Output dettagliato: $DEEP"; return 0; }
     info "Fase 2/3 — Version detection + script default (-sCV) sulle porte: ${ports}"
     for (( t=1; t<=2; t++ )); do
-        nmap_bar "NSE" "$DEEP" "${DEEP}.prog" -p"$ports" -sCV -Pn -T3 --max-retries 5
+        log_cmd "sudo nmap -p$ports -sCV -Pn -T3 --max-retries 5 -oN $DEEP $IP"
+        run sudo nmap -p"$ports" -sCV -Pn -T3 --max-retries 5 -oN "$DEEP" --stats-every 15s "$IP"
         if scan_complete "$DEEP"; then ok "Output dettagliato: $DEEP"; return 0; fi
         warn "Fase 2: incompleta (tentativo ${t}/2)."
     done
@@ -582,7 +603,8 @@ quick_scan() {
     skip_if_done "$QUICK" "quick scan" && return 0
     info "Fase 0 — Quick scan (top 1000, -sS) per un foothold immediato..."
     for (( t=1; t<=2; t++ )); do
-        nmap_bar "QUICK" "$QUICK" "${QUICK}.prog" --top-ports 1000 -sS -Pn -T4 --max-retries 4
+        log_cmd "sudo nmap --top-ports 1000 -sS -Pn -T4 --max-retries 4 -oN $QUICK $IP"
+        run sudo nmap --top-ports 1000 -sS -Pn -T4 --max-retries 4 -oN "$QUICK" --stats-every 15s "$IP"
         if scan_complete "$QUICK"; then
             local qp
             qp=$(grep -hE '^[0-9]+/tcp[[:space:]]+open' "$QUICK" | cut -d/ -f1 | sort -n -u | paste -sd, -)
@@ -758,11 +780,11 @@ scan_target() {
         ok "Modalità ${BOLD}PARALLELA${RST} — ${JOBS} job (auto-tuned sui core, cap 8)."
 
         info "Avvio in parallelo lo UDP scan (top 100, -sU -sV)..."
-        udp_scan_reliable "" &           # niente barra inline: la gestisce il monitor
+        udp_scan_reliable "" &           # silenzioso su file: lo stato lo stampa il loop
         udp_pid="$!"
 
         parallel_tcp_launch "$JOBS"      # lancia i blocchi (senza attendere)
-        monitor_tcp_parallel             # barre live TCP (media blocchi) + UDP
+        status_loop_parallel "$udp_pid"  # stato testuale TCP+UDP ogni ~15s
         parallel_tcp_collect             # attende i blocchi e fonde i confermati
         ports=$(extract_ports)
 
@@ -778,7 +800,7 @@ scan_target() {
 
         echo
         info "Attendo il completamento dello UDP scan..."
-        monitor_one "UDP" "$UDP" "$udp_pid"   # barra UDP residua finché finisce
+        status_wait "UDP" "$UDP" "$udp_pid"   # stato UDP residuo ogni ~15s
         if wait "$udp_pid"; then
             ok "Output UDP: $UDP"; report_udp_ports
         else
