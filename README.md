@@ -13,46 +13,26 @@
          !.........||||                     ||||      by Giva · github.com/Givaa
 ```
 
-**whatsthis** è un automator di ricognizione basato su `nmap`: un singolo script Bash
-che esegue un workflow di scansione completo, affidabile e pensato per il workflow
-da CTF / OSCP. L'obiettivo è semplice: lanci un comando, e ottieni porte, servizi,
-versioni e i **comandi di enumerazione successivi** già pronti da copiare — senza
-perdere porte per strada.
+**whatsthis** is a single Bash script that automates nmap recon: run one command and
+get ports, services, versions, and ready-to-paste next enumeration commands — without
+missing ports. Built for CTF / OSCP workflows.
 
-## Caratteristiche
+## Features
 
-- **Workflow multi-fase**
-  - *Fase 0* — quick-win top 1000 per un foothold immediato
-  - *Fase 1* — full TCP SYN scan su tutte le 65535 porte
-  - *Fase 2* — version detection + NSE default (`-sCV`) **solo** sulle porte aperte
-  - *Fase 3* — UDP top 100 (`-sU -sV`)
-- **Due modalità**
-  - *sequenziale* (default) — un solo stream, timing conservativo: massima affidabilità
-  - *parallela* (`-P`) — porte divise in blocchi concorrenti + UDP in parallelo al TCP;
-    numero di job auto-rilevato dai core (cap 8) o forzato con `-j N`
-- **Garanzie anti-perdita di porte**
-  - `-Pn`: un host che blocca il ping non viene saltato
-  - ogni scansione è valida solo se `nmap` segnala `Nmap done`, altrimenti viene **ritentata**
-  - niente merge silenzioso di dati parziali: i range non confermati sono elencati
-    e lo script esce con codice ≠ 0
-- **Risoluzione hostname** — reverse DNS + mappatura opzionale in `/etc/hosts`
-- **Suggerimenti per servizio** — `next-steps.txt` con i comandi di enumerazione pronti
-  (web, smb, ftp, ssh, ldap, kerberos, mssql/mysql/postgres, rdp, winrm, ...) — *solo
-  enumerazione, OSCP-safe*
-- **Report Markdown** — `summary.md` riutilizzabile nel report
-- **Multitarget** (`-f targets.txt`) — una cartella per host
-- **Resume/skip** (`-r`) — salta le scansioni già completate
-- **Verbose** (`-v`) — stampa i comandi lanciati
+- **Phases**: quick (top 1000) → full TCP (`-p- -sS`) → version+NSE (`-sCV`, open ports only) → UDP top 100
+- **Modes**: sequential (default, single stream, nmap output on screen) or parallel (`-P`, ports split into concurrent chunks + UDP alongside; jobs auto-detected from cores, cap 8, or `-j N`)
+- **Anti-loss**: `-Pn` (don't skip ping-blocking hosts); each scan must reach `Nmap done` or it's retried; unconfirmed ranges are listed and the script exits non-zero
+- **Hostnames**: discovered from services (smb / ssl-cert / http redirect) and printed. With `-H`, whatsthis also edits `/etc/hosts` (missing aliases, idempotent) and renames the output dir to `<name>-<discovered>`. Off by default so scans never block on a prompt; `-H` asks first, add `-g` to skip the prompt
+- **Per-service hints**: `next-steps.txt` with enumeration commands per service — enumeration only (OSCP-safe)
+- **Markdown report**: `summary.md` with open ports and the exact commands run
+- **Multi-target** (`-f targets.txt`), **resume** (`-r`), **verbose** (`-v`)
 
-## Requisiti
+## Requirements
 
-- `nmap`
-- `bash`
-- privilegi `sudo` (necessari per `-sS` / `-sU`)
-- *(opzionali)* `dig`/`host`/`nslookup` per il reverse DNS; gli strumenti citati nei
-  suggerimenti (`feroxbuster`, `enum4linux-ng`, SecLists, ...) per i passi successivi
+- `nmap`, `bash`, and `sudo` (for `-sS` / `-sU`)
+- optional: `dig`/`host`/`nslookup` (reverse DNS); the tools referenced in the hints (`feroxbuster`, `enum4linux-ng`, SecLists, …)
 
-## Installazione
+## Install
 
 ```bash
 git clone https://github.com/Givaa/whatsthis.git
@@ -60,66 +40,55 @@ cd whatsthis
 chmod +x whatsthis
 ```
 
-## Uso
+## Usage
 
 ```
-./whatsthis [-v] [-P|-S] [-j N] [-r] <IP> <nome>
-./whatsthis [opzioni] -f targets.txt
+./whatsthis [-v] [-P|-S] [-j N] [-r] [-H] [-g] <IP> [name]
+./whatsthis [opts] -f targets.txt
 ```
 
-### Opzioni
+| Option | Meaning |
+|--------|---------|
+| `-P` / `-S` | parallel / sequential (default: sequential) |
+| `-j N` | parallel jobs (implies `-P`; `0` = auto) |
+| `-r` | resume: skip scans already done |
+| `-H` | enable /etc/hosts edits + dir rename (off by default) |
+| `-g` | grant: do every op without asking (use with `-H`) |
+| `-f FILE` | multi-target: one `IP [name]` per line (`#` = comment) |
+| `-v` | verbose: print launched commands |
 
-| Opzione | Descrizione |
-|--------|-------------|
-| `-P` / `-S` | modalità parallela / sequenziale (default: sequenziale) |
-| `-j N` | numero di job in parallelo (implica `-P`; `0` = auto) |
-| `-r` | resume: salta le scansioni già completate (`Nmap done`) |
-| `-f FILE` | multitarget: una riga per host, `IP [nome]` (`#` = commento) |
-| `-v` | verbose: stampa i comandi lanciati |
-| `-h` | help |
+The `name` is optional — with just an IP the output dir is the IP and the real name is
+discovered during the scan.
 
-### Esempi
+### Examples
 
 ```bash
-# Singolo target, sequenziale (massima affidabilità)
-./whatsthis 10.10.10.5 box01
-
-# Parallelo con job auto-tuned
-./whatsthis -P 10.10.10.5 box01
-
-# Multitarget, parallelo, riprende da dove era rimasto
-./whatsthis -P -r -f targets.txt
-```
-
-Esempio di `targets.txt`:
-
-```
-# lab targets
-10.10.10.5 box01
-10.10.10.6 dc01
-10.10.10.7
+./whatsthis 10.10.10.5                  # IP only, sequential
+./whatsthis 10.10.10.5 box01            # named, sequential
+./whatsthis -P 10.10.10.5 box01         # parallel (auto jobs)
+./whatsthis -P -H 10.10.10.5 box01      # also map /etc/hosts (asks first)
+./whatsthis -P -r -f targets.txt        # multi-target, parallel, resume
 ```
 
 ## Output
 
-Tutto finisce in una cartella per host (`./<nome>/`):
+Everything goes into `./<name>/`:
 
-| File | Contenuto |
-|------|-----------|
-| `quick.txt` | quick-win top 1000 (foothold immediato) |
+| File | Contents |
+|------|----------|
+| `quick.txt` | quick-win top 1000 |
 | `allports.txt` | full TCP |
-| `deep.txt` | version detection + NSE |
+| `deep.txt` | version + NSE |
 | `udp.txt` | UDP top 100 |
-| `next-steps.txt` | comandi di enumerazione suggeriti per servizio |
-| `summary.md` | report Markdown |
+| `next-steps.txt` | per-service enumeration hints |
+| `summary.md` | Markdown report (ports + commands run) |
 
-## Nota OSCP
+## OSCP note
 
-whatsthis automatizza solo **ricognizione ed enumerazione** e si limita a *suggerire*
-i comandi successivi: non esegue exploitation automatica, in linea con le regole d'esame.
-Verifica sempre i percorsi degli strumenti (es. SecLists) nei comandi suggeriti rispetto
-alla tua macchina.
+whatsthis only automates **recon/enumeration** and *suggests* the next commands — no
+automatic exploitation, in line with exam rules. Check the tool paths (e.g. SecLists) in
+the suggested commands against your machine.
 
-## Autore
+## Author
 
 Giva — [@Givaa](https://github.com/Givaa)
