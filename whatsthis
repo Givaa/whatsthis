@@ -14,8 +14,9 @@
 #
 # /etc/hosts:
 #   * pre-scan: reverse DNS + mappatura opzionale
-#   * post-scan: estrae gli hostname dai servizi (smb/ssl-cert/http/ldap/PTR)
-#     e propone di aggiungerli (gestisce alias multipli e dedup, idempotente)
+#   * post-scan: estrae gli hostname dai servizi (smb/ssl-cert/http/ldap/PTR),
+#     propone di aggiungerli (alias multipli + dedup, idempotente) e rinomina
+#     la cartella in <nome>-<nome_scoperto> se trova il vero nome host
 #
 # Garanzie anti-perdita (entrambe le modalità):
 #   * -Pn          : un host che blocca il ping NON viene saltato.
@@ -31,9 +32,10 @@
 #   -f FILE      multitarget: una riga per host, "IP [nome]" (# = commento)
 #   -v           verbose: stampa i comandi lanciati
 #
-# Uso: ./whatsthis [-v] [-P|-S] [-j N] [-r] <IP> <nome>
+# Uso: ./whatsthis [-v] [-P|-S] [-j N] [-r] <IP> [nome]
 #      ./whatsthis [opzioni] -f targets.txt
-# Es.: ./whatsthis 10.10.10.5 box01            # singolo, sequenziale
+# Es.: ./whatsthis 10.10.10.5                  # solo IP: cartella = IP, nome auto-scoperto
+#      ./whatsthis 10.10.10.5 box01            # singolo, sequenziale
 #      ./whatsthis -P 10.10.10.5 box01         # parallelo (auto-job)
 #      ./whatsthis -P -r -f targets.txt        # multitarget, parallelo, resume
 #
@@ -172,13 +174,15 @@ if [[ -n "$TARGETFILE" ]]; then
     [[ ${#TARGETS[@]} -gt 0 ]] || { err "Nessun target valido in $TARGETFILE"; exit 1; }
     info "Target dal file: ${BOLD}${#TARGETS[@]}${RST}"
 else
-    if [[ $# -ne 2 ]]; then
-        err "Uso: $0 [-v] [-P|-S] [-j N] [-r] <IP> <nome>"
+    if [[ $# -lt 1 || $# -gt 2 ]]; then
+        err "Uso: $0 [-v] [-P|-S] [-j N] [-r] <IP> [nome]"
         err "     $0 [opzioni] -f targets.txt"
         exit 1
     fi
     validate_ip "$1" || { err "IP non valido: $1"; exit 1; }
-    TARGETS+=("$1|$2")
+    # Nome opzionale: se non lo conosci, la cartella prende l'IP e il nome reale
+    # viene scoperto durante lo scan (reverse DNS + hostname dai servizi).
+    TARGETS+=("$1|${2:-$1}")
 fi
 
 # Rileva quanti job paralleli reggere (cap 8: oltre, il rate-limiting del
@@ -301,12 +305,41 @@ resolve_hostname() {
     [[ -n "$cand" ]] && add_to_hosts "$IP" "$cand"
 }
 
-# Hostname scoperti dai servizi dopo la Fase 2 -> proposta /etc/hosts.
+# Rinomina la cartella di output aggiungendo il nome scoperto: <nome>-<scoperto>.
+# Aggiorna tutte le variabili di path. No-op se il nome è già nel nome cartella
+# o se la destinazione esiste già.
+rename_outdir() {
+    local primary newdir
+    primary=$(printf '%s' "$1" | tr -cd 'A-Za-z0-9._-')
+    [[ -z "$primary" ]] && return
+    [[ "$NAME" == *"$primary"* ]] && return     # nome reale già usato
+    newdir="${NAME}-${primary}"
+    [[ "$newdir" == "$OUTDIR" ]] && return
+    if [[ -e "$newdir" ]]; then
+        warn "Cartella ${newdir}/ già esistente: non rinomino."
+        return
+    fi
+    if mv "$OUTDIR" "$newdir" 2>/dev/null; then
+        ok "Cartella rinominata: ${BOLD}${OUTDIR}/ -> ${newdir}/${RST}"
+        OUTDIR="$newdir"; CHUNKDIR="$OUTDIR/.chunks"
+        QUICK="$OUTDIR/quick.txt"; ALLPORTS="$OUTDIR/allports.txt"
+        DEEP="$OUTDIR/deep.txt"; UDP="$OUTDIR/udp.txt"
+        NEXT="$OUTDIR/next-steps.txt"; SUMMARY="$OUTDIR/summary.md"
+    else
+        err "Impossibile rinominare ${OUTDIR}/ in ${newdir}/."
+    fi
+}
+
+# Hostname scoperti dai servizi dopo la Fase 2 -> rinomina cartella + /etc/hosts.
 discover_hostnames_post() {
-    local names
+    local names primary
     names=$(extract_hostnames "$DEEP")
     [[ -z "$names" ]] && return
     info "Hostname rilevati dai servizi: ${BOLD}$(echo "$names" | paste -sd' ' -)${RST}"
+    # nome "primario" per la cartella: preferisci il computer name (senza punto)
+    primary=$(echo "$names" | grep -v '\.' | head -n1)
+    [[ -z "$primary" ]] && primary=$(echo "$names" | head -n1)
+    rename_outdir "$primary"
     # shellcheck disable=SC2086
     add_to_hosts "$IP" $names
 }
