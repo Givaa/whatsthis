@@ -54,6 +54,22 @@ set -uo pipefail
 
 # --- Colori ---
 RED=$'\e[31m'; GREEN=$'\e[32m'; YELLOW=$'\e[33m'; BLUE=$'\e[34m'; CYAN=$'\e[36m'; BOLD=$'\e[1m'; RST=$'\e[0m'
+WHITE=$'\e[97m'; BLACK=$'\e[30m'
+
+# Colore del banner in base allo sfondo del terminale:
+#   shell scura -> testo bianco, shell chiara -> testo nero.
+# Rileva lo sfondo via COLORFGBG ("fg;bg"); se non disponibile assume scura.
+banner_color() {
+    local bg
+    case "${COLORFGBG:-}" in
+        *';'*) bg="${COLORFGBG##*;}" ;;
+        *)     bg="" ;;
+    esac
+    case "$bg" in
+        7|9|1[0-5]) printf '%s' "$BLACK" ;;   # sfondo chiaro
+        *)          printf '%s' "$WHITE" ;;    # sfondo scuro / sconosciuto
+    esac
+}
 
 err()  { printf '%s[!]%s %s\n' "$RED"   "$RST" "$*" >&2; }
 info() { printf '%s[*]%s %s\n' "$BLUE"  "$RST" "$*"; }
@@ -71,6 +87,11 @@ UNVERIFIED=()     # range/scansioni non confermate (per-target)
 OVERALL_FAIL=0    # 1 se almeno un target è incompleto
 MAX_TRIES=3
 CHUNK_PIDS=(); CHUNK_FILES=(); CHUNK_RANGES=()   # stato blocchi paralleli (per il monitor)
+CMDLOG=""         # file con i comandi nmap lanciati (per il summary)
+
+# Registra un comando lanciato (usato per il report). Append su file: funziona
+# anche dai sotto-shell in background (blocchi paralleli).
+log_cmd() { [[ -n "$CMDLOG" ]] && printf '%s\n' "$*" >> "$CMDLOG"; }
 
 # Esegue un comando in foreground; in verbose lo stampa prima.
 run() {
@@ -92,7 +113,7 @@ confirm() {
 
 # Banner ASCII di avvio (lente d'ingrandimento — "what's this?").
 banner() {
-    printf '%s' "$CYAN"
+    printf '%s' "$(banner_color)"
     cat <<'EOF'
                        .,,uod8B8bou,,.
               ..,uod8BBBBBBBBBBBBBBBBRPFT?l!i:.
@@ -257,6 +278,7 @@ draw_bar() {
 # $1=label $2=outfile(-oN) $3=progfile  resto=argomenti nmap (senza -oN/--stats-every)
 nmap_bar() {
     local label="$1" out="$2" prog="$3"; shift 3
+    log_cmd "sudo nmap $* -oN $out $IP"
     (( VERBOSE )) && printf '%s[>]%s %ssudo nmap %s -oN %s %s%s\n' "$CYAN" "$RST" "$BOLD" "$*" "$out" "$IP" "$RST" >&2
     : > "$prog"
     sudo nmap "$@" -oN "$out" --stats-every 2s "$IP" >"$prog" 2>&1 &
@@ -410,7 +432,7 @@ rename_outdir() {
         OUTDIR="$newdir"; CHUNKDIR="$OUTDIR/.chunks"
         QUICK="$OUTDIR/quick.txt"; ALLPORTS="$OUTDIR/allports.txt"
         DEEP="$OUTDIR/deep.txt"; UDP="$OUTDIR/udp.txt"
-        NEXT="$OUTDIR/next-steps.txt"; SUMMARY="$OUTDIR/summary.md"
+        NEXT="$OUTDIR/next-steps.txt"; SUMMARY="$OUTDIR/summary.md"; CMDLOG="$OUTDIR/.commands"
     else
         err "Impossibile rinominare ${OUTDIR}/ in ${newdir}/."
     fi
@@ -444,6 +466,7 @@ scan_range_reliable() {
         if [[ -n "$label" ]]; then
             nmap_bar "$label" "$out" "${out}.prog" -p"$range" -sS -Pn "$timing" --max-retries 6
         else
+            log_cmd "sudo nmap -p$range -sS -Pn $timing --max-retries 6 -oN $out $IP"
             : > "${out}.prog"
             run sudo nmap -p"$range" -sS -Pn "$timing" --max-retries 6 -oN "$out" --stats-every 2s "$IP" >"${out}.prog" 2>&1
         fi
@@ -504,6 +527,7 @@ udp_scan_reliable() {
         if [[ -n "$label" ]]; then
             nmap_bar "$label" "$UDP" "${UDP}.prog" -sU -sV -Pn --top-ports 100 -T3 --max-retries 4
         else
+            log_cmd "sudo nmap -sU -sV -Pn --top-ports 100 -T3 --max-retries 4 -oN $UDP $IP"
             : > "${UDP}.prog"
             run sudo nmap -sU -sV -Pn --top-ports 100 -T3 --max-retries 4 -oN "$UDP" --stats-every 2s "$IP" >"${UDP}.prog" 2>&1
         fi
@@ -539,6 +563,15 @@ print_open_table() {
     printf '%s%s%s\n' "$YELLOW" "  PORT      STATE   SERVICE" "$RST"
     grep -hE '^[0-9]+/tcp[[:space:]]+open' "$ALLPORTS" | sort -n -u | sed 's/^/  /'
     echo
+}
+
+# Stampa a schermo le porte UDP aperte, o un messaggio se non ce ne sono.
+report_udp_ports() {
+    local up
+    up=$(grep -hE '^[0-9]+/udp[[:space:]]+(open|open\|filtered)' "$UDP" 2>/dev/null \
+        | cut -d/ -f1 | sort -n -u | paste -sd, -)
+    [[ -n "$up" ]] && ok "Porte UDP aperte/filtrate: ${BOLD}${up}${RST}" \
+                   || info "Nessuna porta UDP aperta."
 }
 
 # ============================================================
@@ -660,19 +693,31 @@ generate_summary() {
         printf '_Scan: %s · whatsthis_\n\n' "$(date '+%F %T')"
 
         printf '## Porte TCP aperte\n\n'
-        printf '| Porta | Stato | Servizio | Versione |\n|------:|:-----:|----------|----------|\n'
         local src="$DEEP"; [[ -s "$src" ]] || src="$ALLPORTS"
-        grep -hE '^[0-9]+/tcp[[:space:]]+open' "$src" | sort -n -u | awk '{
-            port=$1; state=$2; svc=$3; $1=$2=$3=""; sub(/^ +/,"");
-            printf "| %s | %s | %s | %s |\n", port, state, svc, $0
-        }'
+        if grep -qhE '^[0-9]+/tcp[[:space:]]+open' "$src" 2>/dev/null; then
+            printf '| Porta | Stato | Servizio | Versione |\n|------:|:-----:|----------|----------|\n'
+            grep -hE '^[0-9]+/tcp[[:space:]]+open' "$src" | sort -n -u | awk '{
+                port=$1; state=$2; svc=$3; $1=$2=$3=""; sub(/^ +/,"");
+                printf "| %s | %s | %s | %s |\n", port, state, svc, $0
+            }'
+        else
+            printf '_Nessuna porta TCP aperta._\n'
+        fi
 
-        if grep -qhE '^[0-9]+/udp[[:space:]]+open' "$UDP" 2>/dev/null; then
-            printf '\n## UDP (top 100)\n\n'
+        printf '\n## Porte UDP (top 100)\n\n'
+        if grep -qhE '^[0-9]+/udp[[:space:]]+(open|open\|filtered)' "$UDP" 2>/dev/null; then
             printf '| Porta | Stato | Servizio |\n|------:|:-----:|----------|\n'
             grep -hE '^[0-9]+/udp[[:space:]]+(open|open\|filtered)' "$UDP" | sort -n -u | awk '{
                 printf "| %s | %s | %s |\n", $1, $2, $3
             }'
+        else
+            printf '_Nessuna porta UDP aperta._\n'
+        fi
+
+        if [[ -s "$CMDLOG" ]]; then
+            printf '\n## Comandi eseguiti\n\n```bash\n'
+            cat "$CMDLOG"
+            printf '```\n'
         fi
 
         printf '\n## File generati\n\n'
@@ -693,9 +738,11 @@ scan_target() {
     QUICK="$OUTDIR/quick.txt"; ALLPORTS="$OUTDIR/allports.txt"
     DEEP="$OUTDIR/deep.txt"; UDP="$OUTDIR/udp.txt"
     NEXT="$OUTDIR/next-steps.txt"; SUMMARY="$OUTDIR/summary.md"
+    CMDLOG="$OUTDIR/.commands"
     TARGET="$IP"          # diventa l'hostname se mappato in /etc/hosts
     INCOMPLETE=0; UNVERIFIED=()
     mkdir -p "$OUTDIR"
+    : > "$CMDLOG"
 
     printf '\n%s%s═══ %s → %s/ ═══%s\n' "$BOLD" "$BLUE" "$IP" "$OUTDIR" "$RST"
 
@@ -733,7 +780,7 @@ scan_target() {
         info "Attendo il completamento dello UDP scan..."
         monitor_one "UDP" "$UDP" "$udp_pid"   # barra UDP residua finché finisce
         if wait "$udp_pid"; then
-            ok "Output UDP: $UDP"
+            ok "Output UDP: $UDP"; report_udp_ports
         else
             err "UDP scan non confermato."
             UNVERIFIED+=("UDP top 100"); INCOMPLETE=1
@@ -760,7 +807,7 @@ scan_target() {
         echo
         info "Fase 3/3 — UDP scan (top 100, -sU -sV)... (può richiedere parecchio)"
         if udp_scan_reliable "UDP"; then
-            ok "Output UDP: $UDP"
+            ok "Output UDP: $UDP"; report_udp_ports
         else
             err "UDP scan non confermato."
             UNVERIFIED+=("UDP top 100"); INCOMPLETE=1
