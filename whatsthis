@@ -3,7 +3,7 @@
 # whatsthis — nmap recon automator
 # Author: Giva (github.com/Givaa)
 #
-# Phases: quick (top 1000) -> full TCP (-p- -sS) -> version+NSE (-sCV) -> UDP top 100
+# Phases: quick (top 1000) -> full TCP (-p- -sS) -> version+NSE (-sCV) -> UDP top 100 (-sUVC)
 #
 # Modes:
 #   sequential (default) — single stream, nmap output on screen
@@ -383,11 +383,11 @@ udp_scan_reliable() {
     local onscreen="${1:-}" t
     skip_if_done "$UDP" "UDP" && return 0
     for (( t=1; t<=2; t++ )); do
-        log_cmd "sudo nmap -sU -sV -Pn --top-ports 100 -T3 --max-retries 4 -oN $UDP $IP"
+        log_cmd "sudo nmap -sU -sV -sC -Pn --top-ports 100 -T3 --max-retries 4 -oN $UDP $IP"
         if [[ -n "$onscreen" ]]; then
-            run sudo nmap -sU -sV -Pn --top-ports 100 -T3 --max-retries 4 -oN "$UDP" "$IP"
+            run sudo nmap -sU -sV -sC -Pn --top-ports 100 -T3 --max-retries 4 -oN "$UDP" "$IP"
         else
-            run sudo nmap -sU -sV -Pn --top-ports 100 -T3 --max-retries 4 -oN "$UDP" "$IP" >/dev/null 2>&1
+            run sudo nmap -sU -sV -sC -Pn --top-ports 100 -T3 --max-retries 4 -oN "$UDP" "$IP" >/dev/null 2>&1
         fi
         scan_complete "$UDP" && return 0
         warn "UDP incomplete (try $t/2)"
@@ -592,6 +592,7 @@ scan_target() {
         else
             ok "TCP: $ports"; print_open_table; phase2_deep "$ports"
         fi
+        kill -0 "$udp_pid" 2>/dev/null && info "TCP done — finishing UDP..."
         wait "$udp_pid" && report_udp_ports || { err "UDP unconfirmed"; UNVERIFIED+=("UDP"); INCOMPLETE=1; }
     else
         info "TCP full scan (all 65535 ports)"
