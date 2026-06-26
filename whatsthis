@@ -437,10 +437,13 @@ print_open_table() {
 }
 
 report_udp_ports() {
-    local up
-    up=$(grep -hE '^[0-9]+/udp[[:space:]]+(open|open\|filtered)' "$UDP" 2>/dev/null \
-        | cut -d/ -f1 | sort -n -u | paste -sd, -)
-    [[ -n "$up" ]] && ok "UDP: $up" || info "UDP: none"
+    local lines up
+    lines=$(grep -hE '^[0-9]+/udp[[:space:]]+(open|open\|filtered)' "$UDP" 2>/dev/null | sort -n -u)
+    if [[ -z "$lines" ]]; then info "UDP: none"; return; fi
+    up=$(printf '%s\n' "$lines" | cut -d/ -f1 | paste -sd, -)
+    ok "UDP: $up"
+    printf '%s%s%s\n' "$YELLOW" "  PORT          STATE         SERVICE" "$RST"
+    printf '%s\n' "$lines" | sed 's/^/  /'
 }
 
 # ============================================================
