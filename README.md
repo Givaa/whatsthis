@@ -19,8 +19,10 @@ missing ports. Built for CTF / OSCP workflows.
 
 ## Features
 
-- **Phases**: quick (top 1000) → full TCP (`-p- -sS`) → version+NSE (`-sCV`, open ports only) → UDP top 100 (`-sUVC`)
-- Single sequential stream — nmap output and the exact command being run are shown on screen
+- **Phases**: quick (top 1000) → full TCP (`-p- -sS`) + version+NSE (`-sCV`, open ports only) → UDP top 100 (`-sUVC`)
+- The quick scan runs **without `-Pn`** as a liveness check: if the host looks down it says so and asks whether to continue (auto-continues in background)
+- **UDP runs in the background, concurrent with the full TCP scan** (one extra process, cleaned up on Ctrl-C)
+- nmap output and the exact command being run are shown on screen
 - **Anti-loss**: `-Pn` (don't skip ping-blocking hosts); each scan must reach `Nmap done` or it's retried; unconfirmed ranges are listed and the script exits non-zero
 - **Hostnames**: discovered from services (smb / ssl-cert / http redirect) and printed. With `-H`, whatsthis also edits `/etc/hosts` (missing aliases, idempotent) and renames the output dir to `<name>-<discovered>`. Off by default so scans never block on a prompt; `-H` asks first, add `-g` to skip the prompt
 - **Per-service hints**: `next-steps.txt` with enumeration commands per service — enumeration only (OSCP-safe)

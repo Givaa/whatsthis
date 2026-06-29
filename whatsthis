@@ -3,11 +3,13 @@
 # whatsthis — nmap recon automator
 # Author: Giva (github.com/Givaa)
 #
-# Phases: quick (top 1000) -> full TCP (-p- -sS) -> version+NSE (-sCV) -> UDP top 100 (-sUVC)
-# Single sequential stream: nmap output and the exact command run are shown on screen.
+# Phases: quick (top 1000) -> full TCP (-p- -sS) + version+NSE (-sCV) -> UDP top 100 (-sUVC)
+# The quick scan runs WITHOUT -Pn as a liveness check (if the host looks down it
+# says so and asks whether to continue). UDP runs in the background, concurrent
+# with the full TCP scan. nmap output and the exact command are shown on screen.
 #
-# Anti-loss: -Pn (don't skip ping-blocking hosts); each scan must reach
-#   "Nmap done" or it's retried; unconfirmed ranges are listed and exit != 0.
+# Anti-loss: -Pn on the deep scans (don't skip ping-blocking hosts); each scan
+#   must reach "Nmap done" or it's retried; unconfirmed ranges exit != 0.
 #
 # Hostnames: always discovered from services and printed. With -H, whatsthis
 #   also edits /etc/hosts (missing aliases) and renames the dir to
@@ -61,6 +63,8 @@ UNVERIFIED=()     # per-target
 OVERALL_FAIL=0
 MAX_TRIES=3
 CMDLOG=""         # file logging the nmap commands (for summary)
+UDP_PID=""        # background UDP scan pid (for cleanup)
+SUDO_KEEPALIVE=""
 
 log_cmd() { [[ -n "$CMDLOG" ]] && printf '%s\n' "$*" >> "$CMDLOG"; }
 
@@ -303,10 +307,10 @@ discover_hostnames_post() {
 quick_scan() {
     local t qp
     skip_if_done "$QUICK" "quick" && return 0
-    info "Quick scan (top 1000)"
+    info "Quick scan (top 1000, no -Pn = also a liveness check)"
     for (( t=1; t<=2; t++ )); do
-        say_cmd "sudo nmap --top-ports 1000 -sS -Pn -T4 --max-retries 4 -oN $QUICK $IP"
-        sudo nmap --top-ports 1000 -sS -Pn -T4 --max-retries 4 -oN "$QUICK" "$IP"
+        say_cmd "sudo nmap --top-ports 1000 -sS -T4 --max-retries 4 -oN $QUICK $IP"
+        sudo nmap --top-ports 1000 -sS -T4 --max-retries 4 -oN "$QUICK" "$IP"
         if scan_complete "$QUICK"; then
             qp=$(grep -hE '^[0-9]+/tcp[[:space:]]+open' "$QUICK" | cut -d/ -f1 | sort -n -u | paste -sd, -)
             [[ -n "$qp" ]] && ok "Quick: $qp" || info "Quick: none"
@@ -345,18 +349,20 @@ phase2_deep() {
     return 1
 }
 
+# Runs silently to file (meant to run in background, concurrent with TCP).
+# The command is printed by the caller before launch; results shown at the end.
 udp_scan() {
     local t
     skip_if_done "$UDP" "UDP" && return 0
-    info "UDP scan (top 100)"
     for (( t=1; t<=2; t++ )); do
-        say_cmd "sudo nmap -sU -sV -sC -Pn --top-ports 100 -T3 --max-retries 4 -oN $UDP $IP"
-        sudo nmap -sU -sV -sC -Pn --top-ports 100 -T3 --max-retries 4 -oN "$UDP" "$IP"
+        sudo nmap -sU -sV -sC -Pn --top-ports 100 -T3 --max-retries 4 -oN "$UDP" "$IP" >/dev/null 2>&1
         scan_complete "$UDP" && return 0
-        warn "UDP incomplete (try $t/2)"
     done
     return 1
 }
+
+# Host looks up unless nmap (quick scan, no -Pn) said otherwise.
+host_is_up() { ! grep -qiE '0 hosts up|host seems down' "$QUICK" 2>/dev/null; }
 
 extract_ports() {
     grep -hE '^[0-9]+/tcp[[:space:]]+open' "$ALLPORTS" 2>/dev/null \
@@ -513,6 +519,24 @@ scan_target() {
     resolve_hostname
     quick_scan
 
+    # Liveness: quick scan ran without -Pn. If host looks down, ask (interactive)
+    # or continue anyway (background/grant) — ping-blocking hosts are common.
+    if ! host_is_up; then
+        warn "$IP looks DOWN (no ping reply — often still up in CTF/OSCP)"
+        if [[ -t 0 ]] && (( ! GRANT )); then
+            printf '%s[?]%s Continue anyway with -Pn? [Y/n] ' "$YELLOW" "$RST"
+            local a; read -r a
+            [[ "$a" =~ ^[nN] ]] && { info "[$IP] skipped"; return 0; }
+        else
+            info "continuing with -Pn"
+        fi
+    fi
+
+    # UDP runs concurrently with the full TCP scan (one extra process).
+    say_cmd "sudo nmap -sU -sV -sC -Pn --top-ports 100 -T3 --max-retries 4 -oN $UDP $IP"
+    info "UDP scan (top 100) running in background..."
+    udp_scan & UDP_PID=$!
+
     local ports=""
     full_tcp_scan || { err "full TCP unconfirmed"; UNVERIFIED+=("1-65535"); INCOMPLETE=1; }
     ports=$(extract_ports)
@@ -522,7 +546,9 @@ scan_target() {
         ok "TCP: $ports"; print_open_table; phase2_deep "$ports"
     fi
 
-    udp_scan && report_udp_ports || { err "UDP unconfirmed"; UNVERIFIED+=("UDP"); INCOMPLETE=1; }
+    kill -0 "$UDP_PID" 2>/dev/null && info "TCP done — finishing UDP..."
+    if wait "$UDP_PID"; then report_udp_ports; else err "UDP unconfirmed"; UNVERIFIED+=("UDP"); INCOMPLETE=1; fi
+    UDP_PID=""
 
     [[ -n "$ports" && -s "$DEEP" ]] && discover_hostnames_post
 
@@ -548,7 +574,9 @@ scan_target() {
 run sudo -v || { err "sudo required for SYN/UDP scans"; exit 1; }
 ( while true; do sudo -n true 2>/dev/null; sleep 50; kill -0 "$$" 2>/dev/null || exit; done ) &
 SUDO_KEEPALIVE=$!
-trap 'kill "$SUDO_KEEPALIVE" 2>/dev/null' EXIT
+cleanup() { kill "$SUDO_KEEPALIVE" "${UDP_PID:-}" 2>/dev/null; }
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT TERM
 
 START=$SECONDS
 for entry in "${TARGETS[@]}"; do
