@@ -4,11 +4,7 @@
 # Author: Giva (github.com/Givaa)
 #
 # Phases: quick (top 1000) -> full TCP (-p- -sS) -> version+NSE (-sCV) -> UDP top 100 (-sUVC)
-#
-# Modes:
-#   sequential (default) — single stream, nmap output on screen
-#   parallel (-P)        — ports split into concurrent chunks + UDP alongside;
-#                          jobs auto-detected from cores (cap 8) or set with -j N
+# Single sequential stream: nmap output and the exact command run are shown on screen.
 #
 # Anti-loss: -Pn (don't skip ping-blocking hosts); each scan must reach
 #   "Nmap done" or it's retried; unconfirmed ranges are listed and exit != 0.
@@ -19,15 +15,13 @@
 #   -H asks first; add -g to do it without asking.
 #
 # Options:
-#   -P/-S    parallel / sequential (default: sequential)
-#   -j N     parallel jobs (implies -P; 0 = auto)
 #   -r       resume: skip scans already done
 #   -H       enable /etc/hosts edits + dir rename (off by default)
 #   -g       grant: do every op without asking (use with -H)
 #   -f FILE  multi-target: one "IP [name]" per line (# = comment)
-#   -v       verbose: print launched commands
+#   -v       verbose: print helper commands too
 #
-# Usage: ./whatsthis [-v] [-P|-S] [-j N] [-r] [-H] [-g] <IP> [name]
+# Usage: ./whatsthis [-v] [-r] [-H] [-g] <IP> [name]
 #        ./whatsthis [opts] -f targets.txt
 #
 # Output dir ./<name>/: quick.txt allports.txt deep.txt udp.txt
@@ -40,7 +34,6 @@ RED=$'\e[31m'; GREEN=$'\e[32m'; YELLOW=$'\e[33m'; BLUE=$'\e[34m'; CYAN=$'\e[36m'
 WHITE=$'\e[97m'; BLACK=$'\e[30m'
 
 # Banner color from terminal background: dark shell -> white, light -> black.
-# Detected via COLORFGBG ("fg;bg"); assumes dark when unavailable.
 banner_color() {
     local bg
     case "${COLORFGBG:-}" in
@@ -59,25 +52,24 @@ ok()   { printf '%s[+]%s %s\n' "$GREEN" "$RST" "$*"; }
 warn() { printf '%s[!]%s %s\n' "$YELLOW" "$RST" "$*" >&2; }
 
 VERBOSE=0
-MODE="seq"        # seq | par
-JOBS=0            # 0 = auto
 RESUME=0
 GRANT=0
-HOSTS=0           # 1 = allow /etc/hosts edits + dir rename (-H); off by default
+HOSTS=0           # 1 = allow /etc/hosts edits + dir rename (-H)
 TARGETFILE=""
 INCOMPLETE=0      # per-target
 UNVERIFIED=()     # per-target
 OVERALL_FAIL=0
 MAX_TRIES=3
-CHUNK_PIDS=(); CHUNK_FILES=(); CHUNK_RANGES=()
 CMDLOG=""         # file logging the nmap commands (for summary)
 
-# Log a launched command (appended to file; works from background subshells).
 log_cmd() { [[ -n "$CMDLOG" ]] && printf '%s\n' "$*" >> "$CMDLOG"; }
 
-# Run a command; print it first in verbose mode.
+# Show the command on screen and log it (so you see what nmap is running).
+say_cmd() { printf '%s$ %s%s\n' "$CYAN" "$*" "$RST"; log_cmd "$*"; }
+
+# Run a helper command; print it first in verbose mode.
 run() {
-    (( VERBOSE )) && printf '%s[>]%s %s%s%s\n' "$CYAN" "$RST" "$BOLD" "$*" "$RST" >&2
+    (( VERBOSE )) && printf '%s$ %s%s\n' "$CYAN" "$*" "$RST" >&2
     "$@"
 }
 
@@ -88,6 +80,13 @@ confirm() {
     printf '%s[?]%s %s [y/N] ' "$YELLOW" "$RST" "$*"
     local ans; read -r ans
     [[ "$ans" =~ ^[yYsS] ]]
+}
+
+# Seconds -> "1h02m03s" / "2m03s".
+human_time() {
+    local s="$1" h m sec
+    h=$(( s/3600 )); m=$(( (s%3600)/60 )); sec=$(( s%60 ))
+    (( h )) && printf '%dh%02dm%02ds' "$h" "$m" "$sec" || printf '%dm%02ds' "$m" "$sec"
 }
 
 # Startup ASCII banner.
@@ -133,9 +132,6 @@ POSARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -v|--verbose)    VERBOSE=1; shift ;;
-        -P|--parallel)   MODE="par"; shift ;;
-        -S|--sequential) MODE="seq"; shift ;;
-        -j|--jobs)       [[ $# -ge 2 ]] || { err "-j needs a number"; exit 1; }; JOBS="$2"; MODE="par"; shift 2 ;;
         -r|--resume)     RESUME=1; shift ;;
         -g|--grant)      GRANT=1; shift ;;
         -H|--hosts)      HOSTS=1; shift ;;
@@ -148,7 +144,6 @@ while [[ $# -gt 0 ]]; do
 done
 set -- ${POSARGS[@]+"${POSARGS[@]}"}
 
-[[ "$JOBS" =~ ^[0-9]+$ ]] || { err "Invalid job count: $JOBS"; exit 1; }
 command -v nmap >/dev/null 2>&1 || { err "nmap not found in PATH"; exit 1; }
 
 banner
@@ -176,24 +171,13 @@ if [[ -n "$TARGETFILE" ]]; then
     info "Targets: ${#TARGETS[@]}"
 else
     if [[ $# -lt 1 || $# -gt 2 ]]; then
-        err "Usage: $0 [-v] [-P|-S] [-j N] [-r] [-H] [-g] <IP> [name]"
+        err "Usage: $0 [-v] [-r] [-H] [-g] <IP> [name]"
         err "       $0 [opts] -f targets.txt"
         exit 1
     fi
     validate_ip "$1" || { err "Invalid IP: $1"; exit 1; }
     TARGETS+=("$1|${2:-$1}")   # name optional: dir = IP, real name found during scan
 fi
-
-# Parallel jobs the machine can take (cap 8: beyond that target rate-limiting
-# starts dropping packets = missed ports).
-detect_jobs() {
-    local n=""
-    if command -v nproc >/dev/null 2>&1; then n=$(nproc 2>/dev/null)
-    elif command -v sysctl >/dev/null 2>&1; then n=$(sysctl -n hw.ncpu 2>/dev/null); fi
-    [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 1 )) || n=4
-    (( n > 8 )) && n=8
-    printf '%s' "$n"
-}
 
 # A scan is "done" only if nmap wrote the "Nmap done" footer.
 scan_complete() { grep -q '^# Nmap done' "$1" 2>/dev/null; }
@@ -209,22 +193,17 @@ skip_if_done() {
 # ============================================================
 # /etc/hosts
 # ============================================================
-
-# Valid hostname: letters/digits/.-_ with at least one letter (excludes IPs).
 valid_hostname() {
     [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$ ]] || return 1
     [[ "$1" =~ [A-Za-z] ]] || return 1
     return 0
 }
 
-# Names already mapped to an IP in /etc/hosts (one per line), ignoring comments.
 hosts_names_for_ip() {
     grep -E "^[[:space:]]*${1//./\\.}[[:space:]]" /etc/hosts 2>/dev/null \
         | sed 's/#.*//' | awk '{$1=""; print}' | tr -s '[:space:]' '\n' | awk 'NF' | sort -u
 }
 
-# Add new/valid names for an IP to /etc/hosts: validates, dedups, adds only
-# missing aliases (idempotent); asks unless --grant; sets TARGET if still the IP.
 add_to_hosts() {
     local ip="$1"; shift
     local existing new=() n m seen
@@ -238,7 +217,6 @@ add_to_hosts() {
         (( seen )) || new+=("$n")
     done
     [[ ${#new[@]} -eq 0 ]] && return 1
-
     confirm "Add to /etc/hosts: ${new[*]} ?" || return 1
     if printf '%s\t%s\n' "$ip" "${new[*]}" | run sudo tee -a /etc/hosts >/dev/null; then
         ok "/etc/hosts += ${new[*]}"
@@ -249,8 +227,8 @@ add_to_hosts() {
     return 1
 }
 
-# Extract candidate hostnames from nmap output (conservative: smb, ssl-cert,
-# http redirects only) and drop noise like nmap.org from nmap's own footer.
+# Conservative hostname extraction (smb, ssl-cert, http redirect); drops noise
+# like nmap.org from nmap's own footer.
 extract_hostnames() {
     local f="$1"
     [[ -s "$f" ]] || return
@@ -266,7 +244,6 @@ extract_hostnames() {
         | awk 'NF' | sort -u
 }
 
-# Reverse DNS + initial mapping (before the scan).
 resolve_hostname() {
     local rev=""
     if command -v dig >/dev/null 2>&1; then
@@ -290,8 +267,6 @@ resolve_hostname() {
     [[ -n "$cand" ]] && (( HOSTS )) && add_to_hosts "$IP" "$cand"
 }
 
-# Rename output dir to <name>-<discovered>, updating all paths. No-op if the
-# name is already used or the destination exists.
 rename_outdir() {
     local primary newdir
     primary=$(printf '%s' "$1" | tr -cd 'A-Za-z0-9._-')
@@ -302,14 +277,13 @@ rename_outdir() {
     confirm "Rename ${OUTDIR}/ -> ${newdir}/ ?" || return
     if mv "$OUTDIR" "$newdir" 2>/dev/null; then
         ok "Renamed: ${OUTDIR}/ -> ${newdir}/"
-        OUTDIR="$newdir"; CHUNKDIR="$OUTDIR/.chunks"
+        OUTDIR="$newdir"
         QUICK="$OUTDIR/quick.txt"; ALLPORTS="$OUTDIR/allports.txt"
         DEEP="$OUTDIR/deep.txt"; UDP="$OUTDIR/udp.txt"
         NEXT="$OUTDIR/next-steps.txt"; SUMMARY="$OUTDIR/summary.md"; CMDLOG="$OUTDIR/.commands"
     fi
 }
 
-# Hostnames discovered from services (after phase 2) -> rename dir + /etc/hosts.
 discover_hostnames_post() {
     local names primary
     names=$(extract_hostnames "$DEEP")
@@ -324,73 +298,35 @@ discover_hostnames_post() {
 }
 
 # ============================================================
-# Reliable scans (retry until "Nmap done")
+# Scans (retry until "Nmap done")
 # ============================================================
-
-# $3 set (sequential) = nmap output to screen; empty (parallel chunk) = silent.
-scan_range_reliable() {
-    local range="$1" out="$2" onscreen="${3:-}" t timing
-    skip_if_done "$out" "range $range" && return 0
-    for (( t=1; t<=MAX_TRIES; t++ )); do
-        timing="-T4"; (( t > 1 )) && timing="-T3"
-        log_cmd "sudo nmap -p$range -sS -Pn $timing --max-retries 6 -oN $out $IP"
-        if [[ -n "$onscreen" ]]; then
-            run sudo nmap -p"$range" -sS -Pn "$timing" --max-retries 6 -oN "$out" "$IP"
-        else
-            run sudo nmap -p"$range" -sS -Pn "$timing" --max-retries 6 -oN "$out" "$IP" >/dev/null 2>&1
+quick_scan() {
+    local t qp
+    skip_if_done "$QUICK" "quick" && return 0
+    info "Quick scan (top 1000)"
+    for (( t=1; t<=2; t++ )); do
+        say_cmd "sudo nmap --top-ports 1000 -sS -Pn -T4 --max-retries 4 -oN $QUICK $IP"
+        sudo nmap --top-ports 1000 -sS -Pn -T4 --max-retries 4 -oN "$QUICK" "$IP"
+        if scan_complete "$QUICK"; then
+            qp=$(grep -hE '^[0-9]+/tcp[[:space:]]+open' "$QUICK" | cut -d/ -f1 | sort -n -u | paste -sd, -)
+            [[ -n "$qp" ]] && ok "Quick: $qp" || info "Quick: none"
+            return 0
         fi
-        scan_complete "$out" && return 0
-        warn "range $range incomplete (try $t/$MAX_TRIES)"
+        warn "quick incomplete (try $t/2)"
     done
     return 1
 }
 
-# Launch parallel chunks (no wait): fills CHUNK_PIDS/FILES/RANGES.
-parallel_tcp_launch() {
-    local jobs="$1"
-    mkdir -p "$CHUNKDIR"
-    (( RESUME )) || rm -f "$CHUNKDIR"/chunk_*.txt
-    CHUNK_PIDS=(); CHUNK_FILES=(); CHUNK_RANGES=()
-    local total=65535 start=1 i=0 per
-    per=$(( (total + jobs - 1) / jobs ))
-    info "TCP full scan — $jobs parallel chunks"
-    while (( start <= total )); do
-        local end=$(( start + per - 1 )); (( end > total )) && end=$total
-        local cf; cf="$CHUNKDIR/chunk_$(printf '%02d' "$i").txt"
-        scan_range_reliable "${start}-${end}" "$cf" &
-        CHUNK_PIDS+=("$!"); CHUNK_FILES+=("$cf"); CHUNK_RANGES+=("${start}-${end}")
-        start=$(( end + 1 )); i=$(( i + 1 ))
-    done
-}
-
-# Wait chunks and merge only the confirmed ones.
-parallel_tcp_collect() {
-    : > "$ALLPORTS"
-    local idx=0 pid
-    for pid in "${CHUNK_PIDS[@]}"; do
-        if wait "$pid"; then
-            cat "${CHUNK_FILES[$idx]}" >> "$ALLPORTS"
-        else
-            err "range ${CHUNK_RANGES[$idx]} unconfirmed"
-            UNVERIFIED+=("${CHUNK_RANGES[$idx]}"); INCOMPLETE=1
-        fi
-        idx=$(( idx + 1 ))
-    done
-}
-
-# $1 set (sequential) = output to screen; empty (parallel) = silent.
-udp_scan_reliable() {
-    local onscreen="${1:-}" t
-    skip_if_done "$UDP" "UDP" && return 0
-    for (( t=1; t<=2; t++ )); do
-        log_cmd "sudo nmap -sU -sV -sC -Pn --top-ports 100 -T3 --max-retries 4 -oN $UDP $IP"
-        if [[ -n "$onscreen" ]]; then
-            run sudo nmap -sU -sV -sC -Pn --top-ports 100 -T3 --max-retries 4 -oN "$UDP" "$IP"
-        else
-            run sudo nmap -sU -sV -sC -Pn --top-ports 100 -T3 --max-retries 4 -oN "$UDP" "$IP" >/dev/null 2>&1
-        fi
-        scan_complete "$UDP" && return 0
-        warn "UDP incomplete (try $t/2)"
+full_tcp_scan() {
+    local t timing
+    skip_if_done "$ALLPORTS" "full TCP" && return 0
+    info "TCP full scan (all 65535 ports)"
+    for (( t=1; t<=MAX_TRIES; t++ )); do
+        timing="-T4"; (( t > 1 )) && timing="-T3"
+        say_cmd "sudo nmap -p- -sS -Pn $timing --max-retries 6 -oN $ALLPORTS $IP"
+        sudo nmap -p- -sS -Pn "$timing" --max-retries 6 -oN "$ALLPORTS" "$IP"
+        scan_complete "$ALLPORTS" && return 0
+        warn "full TCP incomplete (try $t/$MAX_TRIES)"
     done
     return 1
 }
@@ -400,8 +336,8 @@ phase2_deep() {
     skip_if_done "$DEEP" "version/NSE" && return 0
     info "Version/NSE scan: $ports"
     for (( t=1; t<=2; t++ )); do
-        log_cmd "sudo nmap -p$ports -sCV -Pn -T3 --max-retries 5 -oN $DEEP $IP"
-        run sudo nmap -p"$ports" -sCV -Pn -T3 --max-retries 5 -oN "$DEEP" "$IP"
+        say_cmd "sudo nmap -p$ports -sCV -Pn -T3 --max-retries 5 -oN $DEEP $IP"
+        sudo nmap -p"$ports" -sCV -Pn -T3 --max-retries 5 -oN "$DEEP" "$IP"
         scan_complete "$DEEP" && return 0
         warn "version/NSE incomplete (try $t/2)"
     done
@@ -409,19 +345,15 @@ phase2_deep() {
     return 1
 }
 
-quick_scan() {
-    local t qp
-    skip_if_done "$QUICK" "quick" && return 0
-    info "Quick scan (top 1000)"
+udp_scan() {
+    local t
+    skip_if_done "$UDP" "UDP" && return 0
+    info "UDP scan (top 100)"
     for (( t=1; t<=2; t++ )); do
-        log_cmd "sudo nmap --top-ports 1000 -sS -Pn -T4 --max-retries 4 -oN $QUICK $IP"
-        run sudo nmap --top-ports 1000 -sS -Pn -T4 --max-retries 4 -oN "$QUICK" "$IP"
-        if scan_complete "$QUICK"; then
-            qp=$(grep -hE '^[0-9]+/tcp[[:space:]]+open' "$QUICK" | cut -d/ -f1 | sort -n -u | paste -sd, -)
-            [[ -n "$qp" ]] && ok "Quick: $qp" || info "Quick: none"
-            return 0
-        fi
-        warn "quick incomplete (try $t/2)"
+        say_cmd "sudo nmap -sU -sV -sC -Pn --top-ports 100 -T3 --max-retries 4 -oN $UDP $IP"
+        sudo nmap -sU -sV -sC -Pn --top-ports 100 -T3 --max-retries 4 -oN "$UDP" "$IP"
+        scan_complete "$UDP" && return 0
+        warn "UDP incomplete (try $t/2)"
     done
     return 1
 }
@@ -568,47 +500,29 @@ generate_summary() {
 # ============================================================
 scan_target() {
     IP="$1"; NAME="$2"
-    OUTDIR="$NAME"; CHUNKDIR="$OUTDIR/.chunks"
+    OUTDIR="$NAME"
     QUICK="$OUTDIR/quick.txt"; ALLPORTS="$OUTDIR/allports.txt"
     DEEP="$OUTDIR/deep.txt"; UDP="$OUTDIR/udp.txt"
     NEXT="$OUTDIR/next-steps.txt"; SUMMARY="$OUTDIR/summary.md"; CMDLOG="$OUTDIR/.commands"
     TARGET="$IP"
     INCOMPLETE=0; UNVERIFIED=()
+    local t0=$SECONDS
     mkdir -p "$OUTDIR"; : > "$CMDLOG"
 
     printf '\n%s%s=== %s -> %s/ ===%s\n' "$BOLD" "$BLUE" "$IP" "$OUTDIR" "$RST"
     resolve_hostname
     quick_scan
 
-    local ports="" udp_pid
-    if [[ "$MODE" == "par" ]]; then
-        (( JOBS == 0 )) && JOBS=$(detect_jobs)
-        ok "Parallel mode ($JOBS jobs)"
-        info "UDP scan (top 100)"
-        udp_scan_reliable "" &
-        udp_pid="$!"
-        parallel_tcp_launch "$JOBS"
-        parallel_tcp_collect
-        ports=$(extract_ports)
-        if [[ -z "$ports" ]]; then
-            warn "No open TCP ports"
-        else
-            ok "TCP: $ports"; print_open_table; phase2_deep "$ports"
-        fi
-        kill -0 "$udp_pid" 2>/dev/null && info "TCP done — finishing UDP..."
-        wait "$udp_pid" && report_udp_ports || { err "UDP unconfirmed"; UNVERIFIED+=("UDP"); INCOMPLETE=1; }
+    local ports=""
+    full_tcp_scan || { err "full TCP unconfirmed"; UNVERIFIED+=("1-65535"); INCOMPLETE=1; }
+    ports=$(extract_ports)
+    if [[ -z "$ports" ]]; then
+        warn "No open TCP ports"
     else
-        info "TCP full scan (all 65535 ports)"
-        scan_range_reliable "1-65535" "$ALLPORTS" screen || { err "full TCP unconfirmed"; UNVERIFIED+=("1-65535"); INCOMPLETE=1; }
-        ports=$(extract_ports)
-        if [[ -z "$ports" ]]; then
-            warn "No open TCP ports"
-        else
-            ok "TCP: $ports"; print_open_table; phase2_deep "$ports"
-        fi
-        info "UDP scan (top 100)"
-        udp_scan_reliable screen && report_udp_ports || { err "UDP unconfirmed"; UNVERIFIED+=("UDP"); INCOMPLETE=1; }
+        ok "TCP: $ports"; print_open_table; phase2_deep "$ports"
     fi
+
+    udp_scan && report_udp_ports || { err "UDP unconfirmed"; UNVERIFIED+=("UDP"); INCOMPLETE=1; }
 
     [[ -n "$ports" && -s "$DEEP" ]] && discover_hostnames_post
 
@@ -616,33 +530,34 @@ scan_target() {
     generate_summary
     ok "Output: $OUTDIR/ (summary.md, next-steps.txt)"
 
+    local dur=$(( SECONDS - t0 ))
     if (( INCOMPLETE )); then
-        err "[$IP] incomplete — possible missed ports:"
+        err "[$IP] incomplete in $(human_time "$dur") — possible missed ports:"
         for u in "${UNVERIFIED[@]}"; do err "  - $u"; done
         OVERALL_FAIL=1
         return 1
     fi
-    ok "[$IP] done"
+    ok "[$IP] done in $(human_time "$dur")"
     return 0
 }
 
 # ============================================================
 # Run
 # ============================================================
-# One sudo prompt up front, then keep the timestamp warm so long unattended
-# (background) runs don't re-prompt mid-scan.
+# One sudo prompt up front, then keep the timestamp warm for long runs.
 run sudo -v || { err "sudo required for SYN/UDP scans"; exit 1; }
 ( while true; do sudo -n true 2>/dev/null; sleep 50; kill -0 "$$" 2>/dev/null || exit; done ) &
 SUDO_KEEPALIVE=$!
 trap 'kill "$SUDO_KEEPALIVE" 2>/dev/null' EXIT
 
+START=$SECONDS
 for entry in "${TARGETS[@]}"; do
     scan_target "${entry%%|*}" "${entry#*|}"
 done
 
 echo
 if (( OVERALL_FAIL )); then
-    err "Some scans incomplete — see above (retry with -S or -r)"
+    err "Some scans incomplete — see above (retry with -r)"
     exit 2
 fi
-ok "Done: ${#TARGETS[@]} target(s)"
+ok "Done: ${#TARGETS[@]} target(s) in $(human_time $(( SECONDS - START )))"
